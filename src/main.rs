@@ -1,5 +1,6 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+mod evidence;
 mod scanners;
 
 use scanners::{
@@ -19,6 +20,7 @@ use scanners::{
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
 const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_YELLOW: &str = "\x1b[33m";
 
 struct Scanner {
     name: &'static str,
@@ -258,5 +260,38 @@ fn main() {
                 }
             }
         }
+    }
+
+    print_evidence_transaction();
+}
+
+/// Print the shared boot evidence transaction.
+///
+/// This is the only place a boot-wide clean claim can be made: it requires
+/// every participating source (boot id, audit epoch, journal cursor, printk
+/// and ftrace) to hold complete evidence in the same transaction.
+fn print_evidence_transaction() {
+    println!("[Boot evidence transaction]");
+    println!("boot_id={}", evidence::boot_id());
+    for line in evidence::summarize() {
+        let color = match line.verdict {
+            "CLEAN" => COLOR_GREEN,
+            "INCONCLUSIVE" | "MISSING" => COLOR_YELLOW,
+            _ => COLOR_RED,
+        };
+        println!(
+            "{}{}: {} | {}{}",
+            color, line.source, line.verdict, line.detail, COLOR_RESET
+        );
+    }
+
+    if evidence::all_sources_clean() {
+        println!("{}BOOT_VERDICT=CLEAN{}", COLOR_GREEN, COLOR_RESET);
+    } else {
+        println!(
+            "{}BOOT_VERDICT=INCONCLUSIVE (rotation, permission errors, disabled or \
+             redirected sources prevent a full observation){}",
+            COLOR_YELLOW, COLOR_RESET
+        );
     }
 }

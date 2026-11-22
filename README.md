@@ -69,6 +69,28 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - **Journal gaps**: looks for missing spans in the current boot's journal.
 - **Kernel message suppression**: notices unusual suppression of kernel logs.
 
+## Boot evidence transaction
+
+The boot-wide log sources (audit epoch, the systemd journal, printk/dmesg
+controls and ftrace/tracefs) do not publish clean verdicts independently.
+Each of those scanners registers its evidence in one process-wide
+transaction (`src/evidence.rs`):
+
+- the boot-relative coverage window and the number of backing records,
+- the origins of the evidence (procfs/sysfs paths, `journalctl` invocation,
+  journal cursor),
+- every collection error, including permission denials,
+- every state that disables, silences, rotates or redirects the source.
+
+A source only reaches `CLEAN` when its evidence is complete and, for the
+record-based sources (audit, journal), spans a meaningful slice of the boot.
+Legal journal rotation, an audit restart or rate-limit event, restricted
+`dmesg`, a disabled audit subsystem, an unreadable tracefs or an empty query
+result downgrade the source to `INCONCLUSIVE` instead of being mistaken for a
+full observation. The final `[Boot evidence transaction]` section prints the
+per-source window and verdict, and the process-wide `BOOT_VERDICT` is only
+`CLEAN` when every source holds complete evidence.
+
 ## Development pointers
 
 - Format and lint locally with `cargo fmt && cargo check`.
