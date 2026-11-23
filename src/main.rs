@@ -1,7 +1,9 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod packet_path;
 mod scanners;
 
+use packet_path::PacketPathTransaction;
 use scanners::{
     audit_disabled, bpf_kprobe_attachments, bpf_lsm, core_pattern_pipeline, cron_ghost,
     deleted_memfd, fanotify_watchers, ftrace_redirection, hidden_bind_mounts, hidden_listeners,
@@ -26,7 +28,12 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn run(&self) -> ScanOutcome {
+    fn run(&self, path: &PacketPathTransaction) -> ScanOutcome {
+        for &(name, func) in PACKET_PATH_SCANNERS {
+            if name == self.name {
+                return func(path);
+            }
+        }
         (self.func)()
     }
 }
@@ -234,10 +241,35 @@ const SCANNERS: &[Scanner] = &[
     },
 ];
 
+/// Scanners that consume the shared packet-path transaction instead of
+/// collecting their own netfilter or XDP/TC snapshot.
+///
+/// The names are the public scanner-registry contract; keeping the mapping
+/// here preserves the existing scanner list, ordering and output headings.
+const PACKET_PATH_SCANNERS: &[(&str, fn(&PacketPathTransaction) -> ScanOutcome)] = &[
+    (
+        "Netfilter hook drift (orphans/invalid jumps)",
+        netfilter_hook_drift::run_with_path,
+    ),
+    (
+        "Netfilter cloaking artifacts",
+        netfilter_cloaking::run_with_path,
+    ),
+    (
+        "XDP/TC detached programs",
+        xdp_tc_detached::run_with_path,
+    ),
+];
+
 fn main() {
+    // The generation, netns and all three packet-path planes are fixed before
+    // the first scanner runs.  Every packet-path scanner and the final report
+    // share this transaction; no scanner performs its own collection.
+    let path = PacketPathTransaction::start();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
-        match scanner.run() {
+        match scanner.run(&path) {
             Ok(Some(finding)) => {
                 for line in finding.lines() {
                     if line.is_empty() {
@@ -258,5 +290,73 @@ fn main() {
                 }
             }
         }
+    }
+
+    print_packet_path(&path);
+}
+
+/// Print the shared packet-path transaction and risk report.
+///
+/// This is the only place the whole packet path gets a verdict: it requires
+/// the netfilter, interface and eBPF program planes to carry stamps from the
+/// same generation and network namespace.
+fn print_packet_path(path: &PacketPathTransaction) {
+    println!("[Packet path transaction]");
+    for line in path.report().render_lines() {
+        if line.contains("finding=") && !line.contains("finding=packet_path_observed") {
+            println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+        } else if line.starts_with("packet_path=CONSISTENT")
+            || line.starts_with("same_generation=true")
+        {
+            println!("{}{}{}", COLOR_GREEN, line, COLOR_RESET);
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
+/// Alias kept for symmetry with the other report helpers.
+#[allow(dead_code)]
+fn print_packet_path_report(path: &PacketPathTransaction) {
+    print_packet_path(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_path_scanner_mapping_only_references_registered_scanners() {
+        assert_eq!(PACKET_PATH_SCANNERS.len(), 3);
+        for &(name, _) in PACKET_PATH_SCANNERS {
+            assert!(
+                SCANNERS.iter().any(|scanner| scanner.name == name),
+                "packet-path scanner {name:?} is not in SCANNERS"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_registry_order_and_size_are_unchanged() {
+        assert_eq!(SCANNERS.len(), 50);
+        assert_eq!(
+            SCANNERS.first().map(|scanner| scanner.name),
+            Some("Hidden LKM (proc/sysfs vs kallsyms clusters)")
+        );
+        assert_eq!(
+            SCANNERS.last().map(|scanner| scanner.name),
+            Some("Kernel message suppression")
+        );
+    }
+
+    #[test]
+    fn packet_path_scanners_are_the_three_shared_transaction_consumers() {
+        let names: Vec<&str> = PACKET_PATH_SCANNERS
+            .iter()
+            .map(|&(name, _)| name)
+            .collect();
+        assert!(names.contains(&"Netfilter hook drift (orphans/invalid jumps)"));
+        assert!(names.contains(&"Netfilter cloaking artifacts"));
+        assert!(names.contains(&"XDP/TC detached programs"));
     }
 }

@@ -69,10 +69,43 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - **Journal gaps**: looks for missing spans in the current boot's journal.
 - **Kernel message suppression**: notices unusual suppression of kernel logs.
 
+## Packet path transaction
+
+The netfilter hook-drift, netfilter-cloaking and XDP/TC scanners do not
+collect their own evidence.  They share one packet-path transaction
+(`src/packet_path.rs`) started before the scanner loop:
+
+- the boot id, process-local round, start time, PID and network-namespace
+  inode are fixed once,
+- the nftables ruleset (tables, chains, hooks and interfaces), the
+  `bpftool net list` interface/attachment inventory and the eBPF program
+  inventory are collected once and stamped with that generation,
+- a collector that sees evidence from another netns, a failed collector or a
+  cancelled collector never falls back to an earlier round,
+- retrying a failed plane restarts *every* plane under a new generation,
+  because patching one plane against evidence from another instant would mix
+  two rule generations,
+- a second entry point (another `PacketPathTransaction::start()` call) always
+  creates its own generation, and the final report rejects stamps from any
+  other generation or netns.
+
+Every finding names `netns`, `table`, `chain`, `hook`, `interface`,
+`program`, `program_id` and the finding kind.  Netfilter-only paths use a
+`netfilter:` path label, eBPF attachments use a `bpf:` label and genuinely
+shared physical paths use a `joint:` label, so an old table's cloaking chain
+can never be printed as the same path as a newly attached XDP program.
+Regular empty chains, IPv4 and IPv6 families, iptables-nft and native
+nftables tables, and legitimate XDP/TC attachments remain clean.
+
 ## Development pointers
 
 - Format and lint locally with `cargo fmt && cargo check`.
 - New scanners live in `src/scanners/` and expose `pub fn run() -> ScanOutcome` before being registered in `SCANNERS` inside `src/main.rs`.
+- Packet-path scanners belong in the shared transaction: expose
+  `pub fn run_with_path(&PacketPathTransaction) -> ScanOutcome` and register
+  the name in `PACKET_PATH_SCANNERS` inside `src/main.rs`.
+- Packet-path acceptance checks: `bash tests/acceptance/check_packet_path_transaction.sh`
+  and `python3 tests/acceptance/simulate_packet_path.py`.
 
 ## Operational notes
 
