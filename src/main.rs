@@ -1,5 +1,6 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod kernel_evidence;
 mod scanners;
 
 use scanners::{
@@ -235,6 +236,9 @@ const SCANNERS: &[Scanner] = &[
 ];
 
 fn main() {
+    // Freeze one boot/module/symbol generation before any kernel scanner runs.
+    let kernel_generation = kernel_evidence::begin_scan();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
         match scanner.run() {
@@ -259,4 +263,32 @@ fn main() {
             }
         }
     }
+
+    println!("[Kernel evidence generation (boot/module/symbol)]");
+    // The summary is anchored to one generation:
+    // boot_id=... kernel_release=... module_fingerprint=...
+    // symbol_source=... generation=... cross_generation_evidence=...
+    println!("{}", kernel_evidence::summary(&kernel_generation));
+    match kernel_evidence::final_scan_outcome(&kernel_generation) {
+        Ok(Some(finding)) => {
+            for line in finding.lines() {
+                if line.is_empty() {
+                    println!();
+                } else {
+                    println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            for line in err.lines() {
+                if line.is_empty() {
+                    println!();
+                } else {
+                    println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+                }
+            }
+        }
+    }
+    kernel_evidence::finish_scan();
 }

@@ -1,24 +1,38 @@
-use crate::ScanOutcome;
-use std::{
-    collections::{HashMap, HashSet},
-    fs, io,
+use crate::{
+    kernel_evidence::{current_or_collect, KernelEvidence},
+    ScanOutcome,
 };
-
 pub fn run() -> ScanOutcome {
-    let raw_taint = fs::read_to_string("/proc/sys/kernel/tainted")
-        .map_err(|err| format!("failed to read /proc/sys/kernel/tainted: {err}"))?;
+    // KERNEL_EVIDENCE is the one boot_id/kernel_release generation.
+    let evidence = current_or_collect();
+    run_with_evidence(&evidence)
+}
 
-    let taint_value = raw_taint
-        .trim()
-        .parse::<u64>()
-        .map_err(|err| format!("failed to parse tainted value '{raw_taint}': {err}"))?;
+/// Interpret the taint value from the same boot generation as the modules.
+pub fn run_with_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    if let Some(unknown) = evidence.unknown_outcome("kernel_taint") {
+        return Ok(Some(unknown));
+    }
+    if !evidence.taint_current() {
+        return Ok(Some(format!(
+            "collector=kernel_taint state=unknown reason=taint_evidence_generation_mismatch generation={}",
+            evidence.generation().label()
+        )));
+    }
+
+    let taint_value = match &evidence.taint().value {
+        Ok(value) => *value,
+        Err(err) => return Err(err.clone()),
+    };
 
     if taint_value == 0 {
         return Ok(None);
     }
 
-    let module_taints = collect_module_taint_letters()
-        .map_err(|err| format!("failed to collect module taints: {err}"))?;
+    let module_taints = match collect_module_taint_letters(evidence) {
+        Ok(module_taints) => module_taints,
+        Err(err) => return Err(err.clone()),
+    };
 
     let mut active_flags = Vec::new();
     let mut missing_module_flags = Vec::new();
@@ -72,49 +86,20 @@ pub fn run() -> ScanOutcome {
     Ok(Some(message))
 }
 
-fn collect_module_taint_letters() -> io::Result<HashMap<char, Vec<String>>> {
-    let mut map: HashMap<char, HashSet<String>> = HashMap::new();
+fn collect_module_taint_letters(
+    evidence: &KernelEvidence,
+) -> Result<&std::collections::BTreeMap<char, Vec<String>>, &String> {
+    evidence.taint().module_letters.as_ref()
+}
 
-    for entry in fs::read_dir("/sys/module")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let taint_path = entry.path().join("taint");
-        if let Ok(content) = fs::read_to_string(&taint_path) {
-            for ch in content.trim().chars() {
-                if ch.is_ascii_alphabetic() {
-                    map.entry(ch).or_default().insert(name.clone());
-                }
-            }
-        }
-    }
+/// Alias used by front ends that name the shared observation explicitly.
+pub fn run_with_kernel_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
+}
 
-    let modules = fs::read_to_string("/proc/modules")?;
-    for line in modules.lines() {
-        let module_name = line.split_whitespace().next().unwrap_or_default();
-        if module_name.is_empty() {
-            continue;
-        }
-
-        if let Some(start) = line.find('(') {
-            if let Some(end_offset) = line[start + 1..].find(')') {
-                let letters = &line[start + 1..start + 1 + end_offset];
-                for ch in letters.chars() {
-                    if ch.is_ascii_alphabetic() {
-                        map.entry(ch).or_default().insert(module_name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let mut result: HashMap<char, Vec<String>> = HashMap::new();
-    for (letter, modules) in map {
-        let mut names: Vec<String> = modules.into_iter().collect();
-        names.sort();
-        result.insert(letter, names);
-    }
-
-    Ok(result)
+/// Short alias for [`run_with_kernel_evidence`].
+pub fn run_with_kernel(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
 }
 
 #[derive(Clone, Copy)]

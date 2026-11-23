@@ -73,6 +73,34 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 
 - Format and lint locally with `cargo fmt && cargo check`.
 - New scanners live in `src/scanners/` and expose `pub fn run() -> ScanOutcome` before being registered in `SCANNERS` inside `src/main.rs`.
+- Kernel generation acceptance checks: `bash tests/acceptance/check_kernel_evidence_generation.sh`
+  and `python3 tests/acceptance/simulate_kernel_evidence.py`.
+
+## Kernel evidence generation
+
+The kernel module, taint, syscall-table and module-list scanners consume one
+boot-scoped collection generation (`src/kernel_evidence.rs`) created before the
+scanner loop.  The generation fixes:
+
+- `/proc/sys/kernel/random/boot_id` and `/proc/sys/kernel/osrelease`,
+- the fingerprint of the complete module set (an empty set is complete evidence),
+- the configured symbol sources, including `/proc/kallsyms` and every existing
+  `System.map` candidate.
+
+The final `[Kernel evidence generation (boot/module/symbol)]` section prints
+`KERNEL_EVIDENCE boot_id=... kernel_release=... module_fingerprint=...
+symbol_source=... generation=...` and the rejected cross-generation evidence
+count.  A `System.map` for another kernel release is reported as
+`issue=foreign_kernel_release` but its address is never joined to the current
+boot.  Evidence from a superseded generation is published as `state=unknown`
+instead of the old modules or syscall addresses.  A full scan pins the
+generation at startup; if the host changes before the summary is printed, the
+summary reports `host_matches=false` and the final state becomes `STALE`
+instead of combining the two observations.
+
+For local fixtures, `GHOSTSCAN_PROC_ROOT`, `GHOSTSCAN_SYS_ROOT`,
+`GHOSTSCAN_BOOT_ROOT`, `GHOSTSCAN_LIB_MODULES_ROOT`, `GHOSTSCAN_SYSTEM_MAP`
+(a path list) or `GHOSTSCAN_ROOT` can point the collectors at a fake tree.
 
 ## Operational notes
 

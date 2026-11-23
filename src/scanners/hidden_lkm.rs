@@ -1,22 +1,36 @@
-use crate::ScanOutcome;
-use std::{
-    collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::{self, BufRead, BufReader},
+use crate::{
+    kernel_evidence::{current_or_collect, KernelEvidence},
+    ScanOutcome,
 };
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub fn run() -> ScanOutcome {
-    const SOURCES: [(&str, fn() -> io::Result<HashSet<String>>); 3] = [
-        ("proc_modules", collect_proc_modules),
-        ("sysfs", collect_sysfs_modules),
-        ("kallsyms", collect_kallsyms_modules),
-    ];
+    // KERNEL_EVIDENCE is the one boot_id/kernel_release generation.
+    let evidence = current_or_collect();
+    run_with_evidence(&evidence)
+}
 
-    let mut collections: Vec<(&str, HashSet<String>)> = Vec::new();
+/// Compare module inventories from the one boot-scoped collection generation.
+pub fn run_with_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    if let Some(unknown) = evidence.unknown_outcome("hidden_lkm") {
+        return Ok(Some(unknown));
+    }
+    if !evidence.module_sources_current() {
+        return Ok(Some(format!(
+            "collector=hidden_lkm state=unknown reason=module_evidence_generation_mismatch generation={}",
+            evidence.generation().label()
+        )));
+    }
+
+    let mut collections: Vec<(&str, &BTreeSet<String>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for (name, collector) in SOURCES {
-        match collector() {
+    for (name, result) in [
+        ("proc_modules", collect_proc_modules(evidence)),
+        ("sysfs", collect_sysfs_modules(evidence)),
+        ("kallsyms", collect_kallsyms_modules(evidence)),
+    ] {
+        match result {
             Ok(set) => collections.push((name, set)),
             Err(err) => errors.push(format!("{name}: {err}")),
         }
@@ -31,7 +45,7 @@ pub fn run() -> ScanOutcome {
 
     let mut presence: HashMap<String, HashSet<&str>> = HashMap::new();
     for (source, modules) in &collections {
-        for module in modules {
+        for module in modules.iter() {
             presence.entry(module.clone()).or_default().insert(*source);
         }
     }
@@ -74,62 +88,30 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn collect_proc_modules() -> io::Result<HashSet<String>> {
-    let content = fs::read_to_string("/proc/modules")?;
-    let mut modules = HashSet::new();
-
-    for line in content.lines() {
-        if let Some(name) = line.split_whitespace().next() {
-            if !name.is_empty() {
-                modules.insert(name.to_string());
-            }
-        }
-    }
-
-    Ok(modules)
+fn collect_proc_modules<'a>(
+    evidence: &'a KernelEvidence,
+) -> Result<&'a BTreeSet<String>, &'a String> {
+    evidence.module_sources().proc_modules.as_ref()
 }
 
-fn collect_sysfs_modules() -> io::Result<HashSet<String>> {
-    let mut modules = HashSet::new();
-    for entry in fs::read_dir("/sys/module")? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy().to_string();
-            if !name.is_empty() {
-                modules.insert(name);
-            }
-        }
-    }
-    Ok(modules)
+fn collect_sysfs_modules<'a>(
+    evidence: &'a KernelEvidence,
+) -> Result<&'a BTreeSet<String>, &'a String> {
+    evidence.module_sources().sysfs_modules.as_ref()
 }
 
-fn collect_kallsyms_modules() -> io::Result<HashSet<String>> {
-    let file = File::open("/proc/kallsyms")?;
-    let reader = BufReader::new(file);
-    let mut modules = HashSet::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(module) = extract_module_name(&line) {
-            modules.insert(module);
-        }
-    }
-
-    Ok(modules)
+fn collect_kallsyms_modules<'a>(
+    evidence: &'a KernelEvidence,
+) -> Result<&'a BTreeSet<String>, &'a String> {
+    evidence.module_sources().kallsyms_modules.as_ref()
 }
 
-fn extract_module_name(line: &str) -> Option<String> {
-    let start = line.rfind('[')?;
-    let end = line.rfind(']')?;
-    if end + 1 != line.len() || end < start {
-        return None;
-    }
-    let module = &line[start + 1..end];
-    if module.is_empty() {
-        None
-    } else {
-        Some(module.to_string())
-    }
+/// Alias used by front ends that name the shared observation explicitly.
+pub fn run_with_kernel_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
+}
+
+/// Short alias for [`run_with_kernel_evidence`].
+pub fn run_with_kernel(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
 }

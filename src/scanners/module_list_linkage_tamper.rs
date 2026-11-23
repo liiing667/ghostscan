@@ -1,19 +1,37 @@
-use crate::ScanOutcome;
-use std::{collections::BTreeSet, fs, io};
+use crate::{
+    kernel_evidence::{current_or_collect, KernelEvidence},
+    ScanOutcome,
+};
+use std::collections::BTreeSet;
 
 pub fn run() -> ScanOutcome {
+    // KERNEL_EVIDENCE is the one boot_id/kernel_release generation.
+    let evidence = current_or_collect();
+    run_with_evidence(&evidence)
+}
+
+/// Compare `/proc/modules` and `/sys/module` from the same boot generation.
+pub fn run_with_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    if let Some(unknown) = evidence.unknown_outcome("module_list_linkage_tamper") {
+        return Ok(Some(unknown));
+    }
+    if !evidence.module_sources_current() {
+        return Ok(Some(format!(
+            "collector=module_list_linkage_tamper state=unknown reason=module_evidence_generation_mismatch generation={}",
+            evidence.generation().label()
+        )));
+    }
+
     let mut findings = Vec::new();
     let mut errors = Vec::new();
-
-    let sys_modules = match read_sys_modules() {
-        Ok(set) => set,
-        Err(err) => {
-            return Err(format!("failed to read /sys/module: {err}"));
-        }
+    let sources = evidence.module_sources();
+    let sys_modules: BTreeSet<String> = match read_sys_modules(evidence) {
+        Ok(set) => set.clone(),
+        Err(err) => return Err(format!("failed to read /sys/module: {err}")),
     };
 
-    let proc_modules = match read_proc_modules() {
-        Ok(list) => list,
+    let proc_modules: Vec<String> = match read_proc_modules(evidence) {
+        Ok(set) => set.iter().cloned().collect(),
         Err(err) => {
             errors.push(format!("/proc/modules: {err}"));
             Vec::new()
@@ -29,25 +47,14 @@ pub fn run() -> ScanOutcome {
         }
     }
 
+    errors.extend(sources.holder_errors.iter().cloned());
     for module in &sys_modules {
-        let holders_path = format!("/sys/module/{}/holders", module);
-        match fs::read_dir(&holders_path) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let holder = entry.file_name().to_string_lossy().to_string();
-                    if holder == *module {
-                        findings.push(format!(
-                            "module_name={}, this_ptr=unknown, prev_ptr=unknown, next_ptr=unknown, anomaly=self_loop",
-                            module
-                        ));
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                if err.kind() != io::ErrorKind::NotFound {
-                    errors.push(format!("{}: {}", holders_path, err));
-                }
+        if let Some(holders) = sources.sysfs_holders.get(module) {
+            if holders.contains(module) {
+                findings.push(format!(
+                    "module_name={}, this_ptr=unknown, prev_ptr=unknown, next_ptr=unknown, anomaly=self_loop",
+                    module
+                ));
             }
         }
     }
@@ -67,24 +74,24 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn read_sys_modules() -> io::Result<BTreeSet<String>> {
-    let mut set = BTreeSet::new();
-    for entry in fs::read_dir("/sys/module")? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            set.insert(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    Ok(set)
+fn read_sys_modules<'a>(
+    evidence: &'a KernelEvidence,
+) -> Result<&'a BTreeSet<String>, &'a String> {
+    evidence.module_sources().sysfs_modules.as_ref()
 }
 
-fn read_proc_modules() -> io::Result<Vec<String>> {
-    let content = fs::read_to_string("/proc/modules")?;
-    let mut modules = Vec::new();
-    for line in content.lines() {
-        if let Some(name) = line.split_whitespace().next() {
-            modules.push(name.to_string());
-        }
-    }
-    Ok(modules)
+fn read_proc_modules<'a>(
+    evidence: &'a KernelEvidence,
+) -> Result<&'a BTreeSet<String>, &'a String> {
+    evidence.module_sources().proc_modules.as_ref()
+}
+
+/// Alias used by front ends that name the shared observation explicitly.
+pub fn run_with_kernel_evidence(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
+}
+
+/// Short alias for [`run_with_kernel_evidence`].
+pub fn run_with_kernel(evidence: &KernelEvidence) -> ScanOutcome {
+    run_with_evidence(evidence)
 }
