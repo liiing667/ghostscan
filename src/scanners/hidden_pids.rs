@@ -11,15 +11,16 @@ pub fn run() -> ScanOutcome {
     };
 
     let proc_snapshot = match collect_proc_tasks() {
-        Ok(map) => map,
+        Ok(snapshot) => snapshot,
         Err(err) => return Err(err),
     };
 
     let mut findings = Vec::new();
-    let errors = bpf_snapshot.errors;
+    let mut errors = bpf_snapshot.errors;
+    errors.extend(proc_snapshot.errors);
 
     for (pid, record) in &bpf_snapshot.tasks {
-        if !proc_snapshot.contains_key(pid) {
+        if !proc_snapshot.tasks.contains_key(pid) {
             let comm = record.comm.as_deref().unwrap_or("unknown");
             let sources = record.sources.join("|");
             findings.push(format!(

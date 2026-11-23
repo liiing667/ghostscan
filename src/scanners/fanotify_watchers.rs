@@ -53,7 +53,7 @@ fn scan_pid(pid: u32, container_roots: &[String]) -> Result<Vec<String>, String>
         Ok(entries) => entries,
         Err(err) => {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
-                return Ok(Vec::new());
+                return Err(format!("pid={pid} fdinfo: permission denied"));
             }
             return Err(format!("pid={pid} fdinfo: {err}"));
         }
@@ -73,7 +73,10 @@ fn scan_pid(pid: u32, container_roots: &[String]) -> Result<Vec<String>, String>
             Ok(c) => c,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    continue;
+                    return Err(format!(
+                        "pid={pid} fdinfo {}: permission denied",
+                        fd_path.display()
+                    ));
                 }
                 return Err(format!("pid={pid} fdinfo {}: {err}", fd_path.display()));
             }

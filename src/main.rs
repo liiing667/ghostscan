@@ -1,6 +1,7 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
 mod scanners;
+mod scan_summary;
 
 use scanners::{
     audit_disabled, bpf_kprobe_attachments, bpf_lsm, core_pattern_pipeline, cron_ghost,
@@ -15,6 +16,9 @@ use scanners::{
     suspicious_ptrace, syscall_table, systemd_ghost, task_list_mismatch, unknown_kprobes,
     xdp_tc_detached,
 };
+use scan_summary::ScanSummary;
+use std::io::Write;
+use std::process::ExitCode;
 
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
@@ -234,10 +238,34 @@ const SCANNERS: &[Scanner] = &[
     },
 ];
 
-fn main() {
+fn main() -> ExitCode {
+    // One transaction for the whole round. The outcome set, collector
+    // coverage, finding list, failure list, verdict and exit code all live in
+    // this single summary, so they can never diverge from each other.
+    let mut summary = ScanSummary::new();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
-        match scanner.run() {
+
+        // A collector that aborts (panic) is still recorded as a failed
+        // collector rather than taking the whole process down and skipping the
+        // summary, which would otherwise hide coverage behind a non-clean
+        // crash without any failure list.
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scanner.run()
+        })) {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                let reason = panic_message(&panic);
+                eprintln!("collector '{}' aborted: {reason}", scanner.name);
+                summary.record_aborted(scanner.name, format!("collector aborted: {reason}"));
+                continue;
+            }
+        };
+
+        // The per-scanner text is kept exactly as before: findings and errors
+        // in red, clean collectors as green OK.
+        match &outcome {
             Ok(Some(finding)) => {
                 for line in finding.lines() {
                     if line.is_empty() {
@@ -258,5 +286,54 @@ fn main() {
                 }
             }
         }
+
+        summary.record(scanner.name, &outcome);
+    }
+
+    // Build the full report before writing it: a report write failure can
+    // therefore never leave a partial or clean-looking round, and the exit
+    // code below always comes from the same summary as the report.
+    let report = summary.render();
+    if let Err(err) = write_all(&report) {
+        eprintln!("failed to write scan summary: {err}");
+    }
+
+    ExitCode::from(summary.exit_code())
+}
+
+fn write_all(report: &str) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(report.as_bytes())?;
+    handle.flush()
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanner_registry_is_fully_covered_by_the_summary_round() {
+        // The summary must receive exactly one record per registered
+        // collector, so coverage counting always accounts for the full set.
+        let mut summary = ScanSummary::new();
+        for scanner in SCANNERS {
+            summary.record(scanner.name, &Ok(None));
+        }
+        assert_eq!(summary.total(), SCANNERS.len());
+        assert_eq!(summary.covered(), SCANNERS.len());
+        assert_eq!(summary.failure_count(), 0);
+        assert_eq!(summary.verdict(), scan_summary::Verdict::Clean);
+        assert_eq!(summary.exit_code(), 0);
     }
 }

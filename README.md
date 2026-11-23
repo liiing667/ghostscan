@@ -13,7 +13,10 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 ## Reading results
 
 - Each scanner prints a bracketed name followed by either findings, `OK`, or an error string.
-- The process always exits with code `0`; treat the log itself as the verdict.
+- A final `[Summary]` section is the single transaction for the whole round: the complete `ScanOutcome` set, collector coverage, the finding list and the failure list all feed one verdict and one exit code, so the report and the exit status can never disagree.
+- The verdict is `CLEAN` only when every collector ran and nothing was found; `RISK` when at least one collector reported a finding; `INCOMPLETE` when at least one collector failed (for example a permission error); `RISK+INCOMPLETE` when both happen.
+- The exit code mirrors that verdict: `0` for `CLEAN`, `1` when findings exist, `2` when collectors failed, `3` for both. Treat any non-zero code as "not clean"; a failed collector can never leave behind a clean round.
+- Empty scans and collectors with no hits still print `OK` and stay clean on their own; only an actual collector failure moves the round off `CLEAN`. Permission denials are recorded as failures instead of being swallowed as `OK`.
 - Findings are heuristics designed for triage; validate before acting.
 
 ## Available scanners

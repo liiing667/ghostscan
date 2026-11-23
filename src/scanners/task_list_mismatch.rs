@@ -11,19 +11,20 @@ pub fn run() -> ScanOutcome {
     };
 
     let proc_snapshot = match collect_proc_tasks() {
-        Ok(map) => map,
+        Ok(snapshot) => snapshot,
         Err(err) => return Err(err),
     };
 
-    if proc_snapshot.is_empty() {
+    if proc_snapshot.tasks.is_empty() {
         return Err("no tasks enumerated via /proc".to_string());
     }
 
     let mut findings = Vec::new();
-    let errors = bpf_snapshot.errors;
+    let mut errors = bpf_snapshot.errors;
+    errors.extend(proc_snapshot.errors);
 
     for (pid, record) in &bpf_snapshot.tasks {
-        if !proc_snapshot.contains_key(pid) {
+        if !proc_snapshot.tasks.contains_key(pid) {
             let comm = record.comm.as_deref().unwrap_or("unknown");
             let sources = record.sources.join("|");
             findings.push(format!(
@@ -33,7 +34,7 @@ pub fn run() -> ScanOutcome {
         }
     }
 
-    for (pid, comm) in &proc_snapshot {
+    for (pid, comm) in &proc_snapshot.tasks {
         if !bpf_snapshot.tasks.contains_key(pid) {
             findings.push(format!("seen_by=proc_only, pid={}, comm={}", pid, comm));
         }

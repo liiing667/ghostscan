@@ -44,7 +44,7 @@ fn scan_pid(pid: u32) -> Result<Option<String>, String> {
         Ok(entries) => entries,
         Err(err) => {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
-                return Ok(None);
+                return Err(format!("pid={pid} fd: permission denied"));
             }
             return Err(format!("pid={pid} fd: {err}"));
         }
@@ -60,7 +60,10 @@ fn scan_pid(pid: u32) -> Result<Option<String>, String> {
             },
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    continue;
+                    return Err(format!(
+                        "pid={pid} fd {}: permission denied",
+                        fd.path().display()
+                    ));
                 }
                 return Err(format!("pid={pid} fd {}: {err}", fd.path().display()));
             }

@@ -7,7 +7,7 @@ pub fn run() -> ScanOutcome {
         Ok(link) => link,
         Err(err) => {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
-                return Ok(None);
+                return Err(format!("permission denied reading host pid ns: {err}"));
             }
             return Err(format!("failed to read host pid ns: {err}"));
         }
@@ -15,7 +15,7 @@ pub fn run() -> ScanOutcome {
 
     let inventory = collect_container_states(1024);
     let mut findings = Vec::new();
-    let errors = inventory.errors;
+    let mut errors = inventory.errors;
 
     for state in inventory.states {
         if let Some(pid) = state.pid {
@@ -26,9 +26,14 @@ pub fn run() -> ScanOutcome {
                     }
                 }
                 Err(err) => {
-                    if err.kind() != std::io::ErrorKind::PermissionDenied {
-                        continue;
+                    if err.kind() == std::io::ErrorKind::PermissionDenied {
+                        errors.push(format!(
+                            "pid={} pid namespace: permission denied",
+                            pid
+                        ));
                     }
+                    // Other races (process exited, link vanished) are
+                    // transient inventory churn rather than coverage loss.
                 }
             }
         }
