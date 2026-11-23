@@ -1,6 +1,7 @@
 pub mod audit_disabled;
 pub mod bpf_kprobe_attachments;
 pub mod bpf_lsm;
+pub mod collector_scope;
 pub mod container_utils;
 pub mod core_pattern_pipeline;
 pub mod cron_ghost;

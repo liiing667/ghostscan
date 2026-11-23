@@ -1,3 +1,4 @@
+use super::collector_scope::CollectorScope;
 use crate::ScanOutcome;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -6,6 +7,10 @@ use std::{
 };
 
 pub fn run() -> ScanOutcome {
+    let scope = match CollectorScope::current() {
+        Ok(scope) => scope,
+        Err(err) => return Err(err),
+    };
     let mut inode_to_socket = BTreeMap::new();
 
     for path in [
@@ -17,7 +22,8 @@ pub fn run() -> ScanOutcome {
         if let Ok(content) = fs::read_to_string(path) {
             for line in content.lines().skip(1) {
                 if let Some(inode) = line.split_whitespace().nth(9) {
-                    inode_to_socket.insert(inode.to_string(), path.to_string());
+                    inode_to_socket
+                        .insert((scope.netns_inum, inode.to_string()), path.to_string());
                 }
             }
         }
@@ -31,14 +37,14 @@ pub fn run() -> ScanOutcome {
 
     let mut findings = Vec::new();
 
-    for (inode, source) in inode_to_socket {
+    for ((netns_inum, inode), source) in inode_to_socket {
         if inode == "0" {
             continue;
         }
         if !inode_to_owners.contains_key(&inode) {
             findings.push(format!(
-                "proto_source={}, inode={}, owner_pids=∅",
-                source, inode
+                "proto_source={}, netns_inum={}, inode={}, owner_pids=∅, owner_pidns_inum={}",
+                source, netns_inum, inode, scope.pidns_inum
             ));
         }
     }

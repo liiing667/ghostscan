@@ -1,6 +1,7 @@
+use super::collector_scope::CollectorScope;
 use crate::ScanOutcome;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     process::{Command, Stdio},
@@ -8,36 +9,37 @@ use std::{
 
 const BPF_LISTENER_ENTRY_LIMIT: usize = 65536;
 
-#[derive(Ord, PartialOrd, Eq, PartialEq, Clone)]
+/// Identity of one socket in one network namespace.
+///
+/// Endpoints are metadata, not identity: an endpoint can be closed and rebound
+/// with a different socket inode (and often a different owner PID). Joining
+/// collectors by endpoint is therefore unsafe across retries and namespaces.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SocketKey {
+    netns_inum: u32,
+    inode: u64,
     proto: String,
     local: String,
     remote: String,
 }
 
+#[derive(Clone, Debug)]
 struct NetlinkEntry {
-    inode: Option<String>,
-    pids: Vec<u32>,
+    pids: BTreeSet<u32>,
+    pidns_inum: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
 struct BpfListenerRecord {
-    sources: Vec<String>,
+    sources: BTreeSet<String>,
     state: Option<u32>,
-}
-
-#[derive(Default)]
-struct BpfListenerSnapshot {
-    entries: BTreeMap<SocketKey, BpfListenerRecord>,
-    errors: Vec<String>,
 }
 
 impl BpfListenerRecord {
     fn new(source: &str, state: Option<u32>) -> Self {
-        Self {
-            sources: vec![source.to_string()],
-            state,
-        }
+        let mut sources = BTreeSet::new();
+        sources.insert(source.to_string());
+        Self { sources, state }
     }
 
     fn merge(&mut self, source: &str, state: Option<u32>) {
@@ -46,19 +48,63 @@ impl BpfListenerRecord {
                 self.state = Some(value);
             }
         }
-        if !self.sources.iter().any(|existing| existing == source) {
-            self.sources.push(source.to_string());
-        }
+        self.sources.insert(source.to_string());
     }
+
+    fn format_sources(&self) -> String {
+        self.sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
+#[derive(Default)]
+struct BpfListenerSnapshot {
+    entries: BTreeMap<SocketKey, BpfListenerRecord>,
+    errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct ListenerTables {
+    netlink: BTreeMap<SocketKey, NetlinkEntry>,
+    proc: BTreeSet<SocketKey>,
+    bpf: BTreeMap<SocketKey, BpfListenerRecord>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BpfListenerKey {
+    inode: u64,
+    netns_inum: u32,
+    proto: u8,
+    family: u8,
+    port: u16,
+    addr: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BpfListenerValue {
+    state: u32,
+    netns_inum: u32,
+    inode: u64,
+}
+
+fn listener_identity_matches(key: &BpfListenerKey, value: &BpfListenerValue) -> bool {
+    key.netns_inum == value.netns_inum && key.inode == value.inode
 }
 
 #[cfg(target_os = "linux")]
 mod bpf_support {
-    use super::{BpfListenerRecord, BpfListenerSnapshot, SocketKey, current_netns_inum};
+    use super::{
+        BpfListenerKey, BpfListenerRecord, BpfListenerSnapshot, BpfListenerValue,
+        decode_listener_key, listener_identity_matches,
+    };
     use libbpf_rs::{AsRawLibbpf, Iter, Link, MapFlags, ObjectBuilder};
     use std::io::Read;
     use std::mem;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::ptr::{self, NonNull};
 
     const BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hidden_listeners.bpf.o"));
@@ -67,26 +113,6 @@ mod bpf_support {
     const UDP_PROG: &str = "ghostscan_iter_udp";
     const TCP_SOURCE: &str = "ghostscan_bpf_tcp_iter";
     const UDP_SOURCE: &str = "ghostscan_bpf_udp_iter";
-    const FAMILY_INET: u8 = 2;
-    const FAMILY_INET6: u8 = 10;
-    const PROTO_TCP: u8 = 6;
-    const PROTO_UDP: u8 = 17;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct BpfListenerKey {
-        proto: u8,
-        family: u8,
-        port: u16,
-        addr: [u8; 16],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct BpfListenerValue {
-        state: u32,
-        netns_inum: u32,
-    }
 
     pub(super) fn collect_listeners(entry_limit: usize) -> Result<BpfListenerSnapshot, String> {
         let mut snapshot = BpfListenerSnapshot::default();
@@ -98,14 +124,8 @@ mod bpf_support {
             snapshot.errors.push(err);
         }
 
-        let netns = match current_netns_inum() {
-            Ok(value) => value,
-            Err(err) => {
-                snapshot.errors.push(err);
-                return Ok(snapshot);
-            }
-        };
-
+        // A fresh object/map is loaded for every collector pass. A retry can
+        // therefore never read entries left behind by the previous attempt.
         let mut builder = ObjectBuilder::default();
         builder.relaxed_maps(true);
 
@@ -152,6 +172,9 @@ mod bpf_support {
             }
 
             if key_bytes.len() < key_size {
+                snapshot
+                    .errors
+                    .push("listener map returned a truncated key".to_string());
                 continue;
             }
 
@@ -165,15 +188,15 @@ mod bpf_support {
                 },
                 Ok(Some(_)) => {
                     snapshot.errors.push(format!(
-                        "listener value truncated for proto {} port {}",
-                        key.proto, key.port
+                        "listener value truncated for netns {} inode {}",
+                        key.netns_inum, key.inode
                     ));
                     continue;
                 }
                 Ok(None) => {
                     snapshot.errors.push(format!(
-                        "listener value missing for proto {} port {}",
-                        key.proto, key.port
+                        "listener value missing for netns {} inode {}",
+                        key.netns_inum, key.inode
                     ));
                     continue;
                 }
@@ -185,43 +208,24 @@ mod bpf_support {
                 }
             };
 
-            if value.netns_inum != netns {
+            if !listener_identity_matches(&key, &value) {
+                snapshot.errors.push(format!(
+                    "listener key/value identity mismatch: key netns {} inode {}, value netns {} inode {}",
+                    key.netns_inum, key.inode, value.netns_inum, value.inode
+                ));
                 continue;
             }
 
-            let (proto_name, source) = match key.proto {
-                PROTO_TCP => ("tcp", TCP_SOURCE),
-                PROTO_UDP => ("udp", UDP_SOURCE),
-                _ => continue,
-            };
-
-            let (local_ip, remote_ip) = match key.family {
-                FAMILY_INET => {
-                    let mut raw = [0u8; 4];
-                    raw.copy_from_slice(&key.addr[..4]);
-                    (
-                        IpAddr::V4(Ipv4Addr::from(raw)),
-                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    )
+            let (socket_key, source) = match decode_listener_key(&key) {
+                Some(socket_key) => {
+                    let source = match key.proto {
+                        6 => TCP_SOURCE,
+                        17 => UDP_SOURCE,
+                        _ => continue,
+                    };
+                    (socket_key, source)
                 }
-                FAMILY_INET6 => {
-                    let mut raw = [0u8; 16];
-                    raw.copy_from_slice(&key.addr);
-                    (
-                        IpAddr::V6(Ipv6Addr::from(raw)),
-                        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    )
-                }
-                _ => continue,
-            };
-
-            let local = super::format_endpoint(local_ip, key.port);
-            let remote = super::format_endpoint(remote_ip, 0);
-
-            let socket_key = SocketKey {
-                proto: proto_name.to_string(),
-                local,
-                remote,
+                None => continue,
             };
 
             let record = snapshot
@@ -314,29 +318,44 @@ mod bpf_support {
     }
 }
 
-fn collect_bpf_listeners(entry_limit: usize) -> Result<BpfListenerSnapshot, String> {
-    bpf_support::collect_listeners(entry_limit)
+fn decode_listener_key(key: &BpfListenerKey) -> Option<SocketKey> {
+    let proto_name = match key.proto {
+        6 => "tcp",
+        17 => "udp",
+        _ => return None,
+    };
+
+    let (local_ip, remote_ip) = match key.family {
+        2 => {
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&key.addr[..4]);
+            (
+                IpAddr::V4(Ipv4Addr::from(raw)),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            )
+        }
+        10 => {
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(&key.addr);
+            (
+                IpAddr::V6(Ipv6Addr::from(raw)),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            )
+        }
+        _ => return None,
+    };
+
+    Some(SocketKey {
+        netns_inum: key.netns_inum,
+        inode: key.inode,
+        proto: proto_name.to_string(),
+        local: format_endpoint(local_ip, key.port),
+        remote: format_endpoint(remote_ip, 0),
+    })
 }
 
-fn current_netns_inum() -> Result<u32, String> {
-    let link = fs::read_link("/proc/self/ns/net")
-        .map_err(|err| format!("failed to read /proc/self/ns/net: {err}"))?;
-    let target = link.to_string_lossy();
-    let start = target
-        .find('[')
-        .ok_or_else(|| format!("unexpected netns symlink target: {target}"))?;
-    let end = target[start + 1..]
-        .find(']')
-        .map(|idx| start + 1 + idx)
-        .ok_or_else(|| format!("unexpected netns symlink target: {target}"))?;
-    let slice = &target[start + 1..end];
-    let value = slice
-        .parse::<u64>()
-        .map_err(|err| format!("failed to parse netns inum from '{}': {err}", target))?;
-    if value > u32::MAX as u64 {
-        return Err(format!("netns inum {} exceeds u32 range", value));
-    }
-    Ok(value as u32)
+fn collect_bpf_listeners(entry_limit: usize) -> Result<BpfListenerSnapshot, String> {
+    bpf_support::collect_listeners(entry_limit)
 }
 
 pub fn run() -> ScanOutcome {
@@ -350,6 +369,13 @@ pub fn run() -> ScanOutcome {
         return Err("ss not available to query listeners".to_string());
     }
 
+    // A collector pass must have one namespace identity. Without it, a PID or
+    // inode from one namespace could be compared with a socket in another.
+    let scope = match CollectorScope::current() {
+        Ok(scope) => scope,
+        Err(err) => return Err(err),
+    };
+
     let mut errors = Vec::new();
 
     let bpf_snapshot = match collect_bpf_listeners(BPF_LISTENER_ENTRY_LIMIT) {
@@ -362,93 +388,30 @@ pub fn run() -> ScanOutcome {
 
     errors.extend(bpf_snapshot.errors.iter().cloned());
 
-    let mut netlink = BTreeMap::new();
-    let mut proc = BTreeMap::new();
+    let mut tables = ListenerTables {
+        bpf: bpf_snapshot.entries,
+        ..ListenerTables::default()
+    };
 
     for (flags, proto) in [(["-l", "-t"], "tcp"), (["-l", "-u"], "udp")] {
-        match collect_ss(&flags, proto) {
-            Ok(map) => netlink.extend(map),
+        match collect_ss(&flags, proto, scope.netns_inum, scope.pidns_inum) {
+            Ok(map) => tables.netlink.extend(map),
             Err(err) => errors.push(err),
         }
 
-        match collect_proc(proto) {
-            Ok(map) => proc.extend(map),
+        match collect_proc(proto, scope.netns_inum) {
+            Ok(map) => tables.proc.extend(map),
             Err(err) => errors.push(err),
         }
     }
 
-    let mut findings = Vec::new();
+    let mut scopes = BTreeSet::new();
+    scopes.insert(scope.netns_inum);
+    let findings = evaluate_listeners(&tables, &scopes);
+    finish_listener_scan(findings, errors)
+}
 
-    for (key, entry) in &netlink {
-        if proc.contains_key(key) {
-            continue;
-        }
-
-        let bpf_record = bpf_snapshot.entries.get(key);
-
-        let mut segments = vec![
-            format!("proto={}", key.proto),
-            format!("laddr={}", key.local),
-            format!("raddr={}", key.remote),
-        ];
-
-        let mut seen_by = vec!["netlink".to_string()];
-        if let Some(record) = bpf_record {
-            seen_by.push("bpf".to_string());
-            segments.push(format!("bpf_sources={}", record.sources.join("|")));
-            if let Some(state) = record.state {
-                segments.push(format!("bpf_state={state}"));
-            }
-        }
-        segments.push(format!("seen_by={}", seen_by.join("|")));
-
-        let mut missing = vec!["proc".to_string()];
-        if bpf_record.is_none() {
-            missing.push("bpf".to_string());
-        }
-        segments.push(format!("missing={}", missing.join("|")));
-        segments.push(format!(
-            "inode={}",
-            entry.inode.as_deref().unwrap_or("unknown")
-        ));
-        segments.push(format!("owner_pids={}", format_owner_pids(&entry.pids)));
-
-        findings.push(segments.join(", "));
-    }
-
-    for (key, record) in &bpf_snapshot.entries {
-        if netlink.contains_key(key) {
-            continue;
-        }
-
-        let proc_seen = proc.contains_key(key);
-
-        let mut segments = vec![
-            format!("proto={}", key.proto),
-            format!("laddr={}", key.local),
-            format!("raddr={}", key.remote),
-        ];
-
-        let mut seen_by = vec!["bpf".to_string()];
-        if proc_seen {
-            seen_by.push("proc".to_string());
-        }
-        segments.push(format!("seen_by={}", seen_by.join("|")));
-
-        let mut missing = vec!["netlink".to_string()];
-        if !proc_seen {
-            missing.push("proc".to_string());
-        }
-        segments.push(format!("missing={}", missing.join("|")));
-
-        segments.push(format!("bpf_sources={}", record.sources.join("|")));
-        if let Some(state) = record.state {
-            segments.push(format!("bpf_state={state}"));
-        }
-
-        findings.push(segments.join(", "));
-    }
-
+fn finish_listener_scan(findings: Vec<String>, errors: Vec<String>) -> ScanOutcome {
     if findings.is_empty() {
         if errors.is_empty() {
             Ok(None)
@@ -456,7 +419,7 @@ pub fn run() -> ScanOutcome {
             Err(errors.join(", "))
         }
     } else {
-        findings.sort();
+        let mut findings = findings;
         if !errors.is_empty() {
             findings.push(format!("collection_errors={}", errors.join(", ")));
         }
@@ -464,7 +427,91 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn collect_ss(flags: &[&str], proto: &str) -> Result<BTreeMap<SocketKey, NetlinkEntry>, String> {
+/// Compare only records with the same `(netns, inode, endpoint)` identity.
+///
+/// This function is deliberately pure so the cross-namespace/retry guarantees
+/// can be checked with fixed snapshots without requiring BPF privileges.
+fn evaluate_listeners(tables: &ListenerTables, scopes: &BTreeSet<u32>) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    for netns_inum in scopes {
+        for (key, entry) in &tables.netlink {
+            if key.netns_inum != *netns_inum || tables.proc.contains(key) {
+                continue;
+            }
+
+            let bpf_record = tables.bpf.get(key);
+            let mut segments = listener_segments(key);
+
+            let mut seen_by = vec!["netlink".to_string()];
+            if let Some(record) = bpf_record {
+                seen_by.push("bpf".to_string());
+                segments.push(format!("bpf_sources={}", record.format_sources()));
+                if let Some(state) = record.state {
+                    segments.push(format!("bpf_state={state}"));
+                }
+            }
+            segments.push(format!("seen_by={}", seen_by.join("|")));
+
+            let mut missing = vec!["proc".to_string()];
+            if bpf_record.is_none() {
+                missing.push("bpf".to_string());
+            }
+            segments.push(format!("missing={}", missing.join("|")));
+            segments.push(format!("owner_pids={}", format_owner_pids(&entry.pids)));
+            segments.push(format!("owner_pidns_inum={}", entry.pidns_inum));
+
+            findings.push(segments.join(", "));
+        }
+
+        for (key, record) in &tables.bpf {
+            if key.netns_inum != *netns_inum || tables.netlink.contains_key(key) {
+                continue;
+            }
+
+            let proc_seen = tables.proc.contains(key);
+            let mut segments = listener_segments(key);
+
+            let mut seen_by = vec!["bpf".to_string()];
+            if proc_seen {
+                seen_by.push("proc".to_string());
+            }
+            segments.push(format!("seen_by={}", seen_by.join("|")));
+
+            let mut missing = vec!["netlink".to_string()];
+            if !proc_seen {
+                missing.push("proc".to_string());
+            }
+            segments.push(format!("missing={}", missing.join("|")));
+            segments.push(format!("bpf_sources={}", record.format_sources()));
+            if let Some(state) = record.state {
+                segments.push(format!("bpf_state={state}"));
+            }
+
+            findings.push(segments.join(", "));
+        }
+    }
+
+    findings.sort();
+    findings
+}
+
+fn listener_segments(key: &SocketKey) -> Vec<String> {
+    vec![
+        format!("netns_inum={}", key.netns_inum),
+        format!("inode={}", key.inode),
+        format!("proto={}", key.proto),
+        format!("laddr={}", key.local),
+        format!("raddr={}", key.remote),
+    ]
+}
+
+fn collect_ss(
+    flags: &[&str],
+    proto: &str,
+    netns_inum: u32,
+    pidns_inum: u32,
+) -> Result<BTreeMap<SocketKey, NetlinkEntry>, String> {
     let mut args = vec!["-H", "-n", "-a", "-p"];
     args.extend_from_slice(flags);
     let output = Command::new("ss")
@@ -498,40 +545,44 @@ fn collect_ss(flags: &[&str], proto: &str) -> Result<BTreeMap<SocketKey, Netlink
         };
 
         let key = SocketKey {
+            netns_inum,
+            inode: extract_inode(line).unwrap_or(0),
             proto: proto.to_string(),
             local,
             remote,
         };
 
-        let inode = extract_inode(line);
-        let pids = extract_pids(line);
-        map.insert(key, NetlinkEntry { inode, pids });
+        let entry = map.entry(key).or_insert_with(|| NetlinkEntry {
+            pids: BTreeSet::new(),
+            pidns_inum,
+        });
+        entry.pids.extend(extract_pids(line));
     }
 
     Ok(map)
 }
 
-fn extract_inode(line: &str) -> Option<String> {
+fn extract_inode(line: &str) -> Option<u64> {
     line.split_whitespace()
         .find_map(|segment| segment.strip_prefix("ino:"))
-        .map(|inode| inode.to_string())
+        .and_then(|inode| inode.parse::<u64>().ok())
 }
 
-fn extract_pids(line: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
+fn extract_pids(line: &str) -> BTreeSet<u32> {
+    let mut pids = BTreeSet::new();
     let mut remaining = line;
     while let Some(idx) = remaining.find("pid=") {
         let tail = &remaining[idx + 4..];
         let pid_str: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(pid) = pid_str.parse::<u32>() {
-            pids.push(pid);
+            pids.insert(pid);
         }
         remaining = &tail[pid_str.len()..];
     }
     pids
 }
 
-fn format_owner_pids(pids: &[u32]) -> String {
+fn format_owner_pids(pids: &BTreeSet<u32>) -> String {
     if pids.is_empty() {
         "∅".to_string()
     } else {
@@ -569,8 +620,8 @@ fn normalize_endpoint(raw: &str) -> Option<String> {
     None
 }
 
-fn collect_proc(proto: &str) -> Result<BTreeMap<SocketKey, ()>, String> {
-    let mut map = BTreeMap::new();
+fn collect_proc(proto: &str, netns_inum: u32) -> Result<BTreeSet<SocketKey>, String> {
+    let mut map = BTreeSet::new();
     let files = [
         format!("/proc/net/{proto}"),
         format!("/proc/net/{}6", proto),
@@ -600,15 +651,17 @@ fn collect_proc(proto: &str) -> Result<BTreeMap<SocketKey, ()>, String> {
                 Some(value) => value,
                 None => continue,
             };
+            let Ok(inode) = fields[9].parse::<u64>() else {
+                continue;
+            };
 
-            map.insert(
-                SocketKey {
-                    proto: proto.to_string(),
-                    local,
-                    remote,
-                },
-                (),
-            );
+            map.insert(SocketKey {
+                netns_inum,
+                inode,
+                proto: proto.to_string(),
+                local,
+                remote,
+            });
         }
     }
 
@@ -662,5 +715,189 @@ fn format_endpoint(addr: IpAddr, port: u16) -> String {
     match addr {
         IpAddr::V4(v4) => format!("{}:{}", v4, port),
         IpAddr::V6(v6) => format!("[{}]:{}", v6, port),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem;
+
+    fn socket_key(
+        netns_inum: u32,
+        inode: u64,
+        proto: &str,
+        local: &str,
+        remote: &str,
+    ) -> SocketKey {
+        SocketKey {
+            netns_inum,
+            inode,
+            proto: proto.to_string(),
+            local: local.to_string(),
+            remote: remote.to_string(),
+        }
+    }
+
+    fn netlink_entry(pidns_inum: u32, pids: &[u32]) -> NetlinkEntry {
+        NetlinkEntry {
+            pids: pids.iter().copied().collect(),
+            pidns_inum,
+        }
+    }
+
+    #[test]
+    fn same_endpoint_after_retry_never_reuses_old_pid() {
+        let endpoint = ("tcp", "0.0.0.0:8080", "0.0.0.0:0");
+        let old_socket = socket_key(100, 11, endpoint.0, endpoint.1, endpoint.2);
+        let new_socket = socket_key(100, 12, endpoint.0, endpoint.1, endpoint.2);
+
+        let mut tables = ListenerTables::default();
+        tables
+            .netlink
+            .insert(old_socket, netlink_entry(700, &[111]));
+        tables.proc.insert(new_socket);
+
+        let findings = evaluate_listeners(&tables, &BTreeSet::from([100u32]));
+
+        assert_eq!(
+            findings,
+            vec![
+                "netns_inum=100, inode=11, proto=tcp, laddr=0.0.0.0:8080, raddr=0.0.0.0:0, seen_by=netlink, missing=proc|bpf, owner_pids=111, owner_pidns_inum=700"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn bpf_record_never_moves_to_a_reused_endpoint() {
+        let endpoint = ("tcp", "0.0.0.0:8080", "0.0.0.0:0");
+        let old_socket = socket_key(100, 11, endpoint.0, endpoint.1, endpoint.2);
+        let new_socket = socket_key(100, 12, endpoint.0, endpoint.1, endpoint.2);
+
+        let mut tables = ListenerTables::default();
+        tables
+            .netlink
+            .insert(old_socket, netlink_entry(700, &[111]));
+        tables.proc.insert(new_socket.clone());
+        tables
+            .bpf
+            .insert(new_socket, BpfListenerRecord::new("bpf#9", Some(10)));
+
+        let findings = evaluate_listeners(&tables, &BTreeSet::from([100u32]));
+
+        assert_eq!(findings.len(), 2, "findings: {findings:?}");
+        let old_line = findings
+            .iter()
+            .find(|line| line.contains("inode=11"))
+            .unwrap();
+        let new_line = findings
+            .iter()
+            .find(|line| line.contains("inode=12"))
+            .unwrap();
+        assert!(old_line.contains("owner_pids=111"), "{old_line}");
+        assert!(old_line.contains("seen_by=netlink"), "{old_line}");
+        assert!(!old_line.contains("bpf_sources"), "{old_line}");
+        assert!(new_line.contains("bpf_sources=bpf#9"), "{new_line}");
+        assert!(!new_line.contains("owner_pids=111"), "{new_line}");
+    }
+
+    #[test]
+    fn identical_endpoints_in_two_netns_are_not_joined() {
+        let endpoint = ("tcp", "0.0.0.0:8080", "0.0.0.0:0");
+        let hidden = socket_key(100, 11, endpoint.0, endpoint.1, endpoint.2);
+        let visible = socket_key(200, 22, endpoint.0, endpoint.1, endpoint.2);
+
+        let mut tables = ListenerTables::default();
+        tables
+            .netlink
+            .insert(hidden, netlink_entry(700, &[111]));
+        tables
+            .netlink
+            .insert(visible.clone(), netlink_entry(800, &[222]));
+        tables.proc.insert(visible);
+
+        let findings = evaluate_listeners(&tables, &BTreeSet::from([100u32, 200]));
+
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].contains("netns_inum=100"), "{}", findings[0]);
+        assert!(findings[0].contains("inode=11"), "{}", findings[0]);
+        assert!(findings[0].contains("owner_pids=111"), "{}", findings[0]);
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_keep_distinct_socket_identity() {
+        let v4 = socket_key(100, 11, "tcp", "0.0.0.0:8080", "0.0.0.0:0");
+        let v6 = socket_key(100, 12, "tcp", "[::]:8080", "[::]:0");
+
+        let mut tables = ListenerTables::default();
+        tables.netlink.insert(v4, netlink_entry(700, &[111]));
+        tables.netlink.insert(v6, netlink_entry(700, &[112]));
+
+        let findings = evaluate_listeners(&tables, &BTreeSet::from([100u32]));
+
+        assert_eq!(findings.len(), 2, "findings: {findings:?}");
+        assert!(findings
+            .iter()
+            .any(|line| line.contains("laddr=0.0.0.0:8080")));
+        assert!(findings
+            .iter()
+            .any(|line| line.contains("laddr=[::]:8080")));
+    }
+
+    #[test]
+    fn empty_tables_are_clean_and_truncation_errors_are_kept() {
+        assert!(matches!(
+            finish_listener_scan(Vec::new(), Vec::new()),
+            Ok(None)
+        ));
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            collect_bpf_listeners(0),
+            Err(err) if err == "entry_limit must be non-zero"
+        ));
+        assert_eq!(
+            finish_listener_scan(Vec::new(), vec!["listener map truncated".to_string()]),
+            Err("listener map truncated".to_string())
+        );
+    }
+
+    #[test]
+    fn bpf_key_and_value_must_describe_the_same_object() {
+        assert_eq!(mem::size_of::<BpfListenerKey>(), 32);
+        assert_eq!(mem::size_of::<BpfListenerValue>(), 16);
+        let key = BpfListenerKey {
+            inode: 11,
+            netns_inum: 100,
+            proto: 6,
+            family: 2,
+            port: 8080,
+            addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let decoded = decode_listener_key(&key).unwrap();
+        assert_eq!(decoded.netns_inum, 100);
+        assert_eq!(decoded.inode, 11);
+        assert_eq!(decoded.local, "127.0.0.1:8080");
+
+        let mut value = BpfListenerValue {
+            state: 10,
+            netns_inum: 100,
+            inode: 12,
+        };
+        assert!(!listener_identity_matches(&key, &value));
+        value.inode = key.inode;
+        assert!(listener_identity_matches(&key, &value));
+    }
+
+    #[test]
+    fn proc_endpoint_parser_supports_ipv4_and_ipv6() {
+        assert_eq!(
+            parse_proc_endpoint("0100007F:1F90", false),
+            Some("127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            parse_proc_endpoint("00000000000000000000000000000000:1F90", true),
+            Some("[::]:8080".to_string())
+        );
     }
 }

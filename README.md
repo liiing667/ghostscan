@@ -15,6 +15,9 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - Each scanner prints a bracketed name followed by either findings, `OK`, or an error string.
 - The process always exits with code `0`; treat the log itself as the verdict.
 - Findings are heuristics designed for triage; validate before acting.
+- Namespace-aware socket comparisons surface `netns_inum` and `inode`; PID comparisons surface
+  `pidns_inum`. Comparisons are made only within one namespace and one socket inode, so re-bound
+  endpoints and equal numeric PIDs in other containers are not merged.
 
 ## Available scanners
 

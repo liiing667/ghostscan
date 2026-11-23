@@ -9,6 +9,9 @@
 #define GHOST_TCP_LISTEN 10
 
 struct ghostscan_listener_key {
+    /* (netns, inode) is the identity; endpoint fields are metadata. */
+    __u64 inode;
+    __u32 netns_inum;
     __u8 proto;
     __u8 family;
     __u16 port;
@@ -18,6 +21,7 @@ struct ghostscan_listener_key {
 struct ghostscan_listener_value {
     __u32 state;
     __u32 netns_inum;
+    __u64 inode;
 };
 
 struct {
@@ -28,8 +32,40 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } ghostscan_listener_sockets SEC(".maps");
 
+static __always_inline __u64 socket_inode(const struct sock_common *common)
+{
+    const struct sock *sk = (const struct sock *)common;
+    struct socket *socket = NULL;
+    struct file *file = NULL;
+    struct inode *inode = NULL;
+
+    if (!sk) {
+        return 0;
+    }
+
+    BPF_CORE_READ_INTO(&socket, sk, sk_socket);
+    if (!socket) {
+        return 0;
+    }
+
+    BPF_CORE_READ_INTO(&file, socket, file);
+    if (!file) {
+        return 0;
+    }
+
+    BPF_CORE_READ_INTO(&inode, file, f_inode);
+    if (!inode) {
+        return 0;
+    }
+
+    return BPF_CORE_READ(inode, i_ino);
+}
+
 static __always_inline void record_sock_common(const struct sock_common *common, __u8 proto, __u32 state)
 {
+    __u32 netns_inum = 0;
+    __u64 inode = 0;
+
     if (!common) {
         return;
     }
@@ -50,7 +86,20 @@ static __always_inline void record_sock_common(const struct sock_common *common,
         return;
     }
 
+    struct net *net = NULL;
+    BPF_CORE_READ_INTO(&net, common, skc_net.net);
+    if (net) {
+        netns_inum = BPF_CORE_READ(net, ns.inum);
+    }
+    if (!netns_inum) {
+        return;
+    }
+
+    inode = socket_inode(common);
+
     struct ghostscan_listener_key key = {
+        .inode = inode,
+        .netns_inum = netns_inum,
         .proto = proto,
         .family = fam,
         .port = num,
@@ -69,14 +118,9 @@ static __always_inline void record_sock_common(const struct sock_common *common,
 
     struct ghostscan_listener_value value = {
         .state = state,
-        .netns_inum = 0,
+        .netns_inum = netns_inum,
+        .inode = inode,
     };
-
-    struct net *net = NULL;
-    BPF_CORE_READ_INTO(&net, common, skc_net.net);
-    if (net) {
-        value.netns_inum = BPF_CORE_READ(net, ns.inum);
-    }
 
     bpf_map_update_elem(&ghostscan_listener_sockets, &key, &value, BPF_ANY);
 }

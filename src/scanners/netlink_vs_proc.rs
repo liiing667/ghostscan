@@ -1,3 +1,4 @@
+use super::collector_scope::CollectorScope;
 use crate::ScanOutcome;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -5,6 +6,25 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     process::{Command, Stdio},
 };
+
+/// Socket identity shared by the netlink and procfs views.
+///
+/// `inode` is what distinguishes an old, closed socket from a new socket that
+/// has rebound the same address. `netns_inum` prevents identical inode/PID
+/// values in different containers from being compared with each other.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SocketKey {
+    netns_inum: u32,
+    inode: u64,
+    proto: String,
+    local: String,
+    remote: String,
+}
+
+struct NetlinkEntry {
+    pids: BTreeSet<u32>,
+    pidns_inum: u32,
+}
 
 pub fn run() -> ScanOutcome {
     if Command::new("ss")
@@ -17,51 +37,27 @@ pub fn run() -> ScanOutcome {
         return Err("ss not available to query sockets".to_string());
     }
 
+    let scope = match CollectorScope::current() {
+        Ok(scope) => scope,
+        Err(err) => return Err(err),
+    };
+
     let mut netlink_map = BTreeMap::new();
-    let mut proc_map = BTreeMap::new();
+    let mut proc_map = BTreeSet::new();
     let mut errors = Vec::new();
 
     for (flag, proto) in [("-t", "tcp"), ("-u", "udp")] {
-        match collect_ss(flag, proto) {
+        match collect_ss(flag, proto, scope.netns_inum, scope.pidns_inum) {
             Ok(map) => netlink_map.extend(map),
             Err(err) => errors.push(err),
         }
-        match collect_proc(proto) {
+        match collect_proc(proto, scope.netns_inum) {
             Ok(map) => proc_map.extend(map),
             Err(err) => errors.push(err),
         }
     }
 
-    let mut findings = Vec::new();
-
-    for (key, entry) in &netlink_map {
-        if !proc_map.contains_key(key) {
-            let inode = entry.inode.clone().unwrap_or_else(|| "unknown".to_string());
-            let owners = if entry.pids.is_empty() {
-                "∅".to_string()
-            } else {
-                entry
-                    .pids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("|")
-            };
-            findings.push(format!(
-                "from=netlink_only, proto={}, laddr={}, raddr={}, inode={}, owner_pids={}",
-                key.proto, key.local, key.remote, inode, owners
-            ));
-        }
-    }
-
-    for (key, entry) in &proc_map {
-        if !netlink_map.contains_key(key) {
-            findings.push(format!(
-                "from=proc_only, proto={}, laddr={}, raddr={}, inode={}, owner_pids=unknown",
-                key.proto, key.local, key.remote, entry.inode
-            ));
-        }
-    }
+    let mut findings = evaluate_socket_tables(&netlink_map, &proc_map);
 
     if findings.is_empty() {
         if errors.is_empty() {
@@ -70,7 +66,6 @@ pub fn run() -> ScanOutcome {
             Err(errors.join(", "))
         }
     } else {
-        findings.sort();
         if !errors.is_empty() {
             findings.push(format!("collection_errors={}", errors.join(", ")));
         }
@@ -78,7 +73,46 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn collect_ss(flag: &str, proto: &str) -> Result<BTreeMap<SocketKey, NetlinkEntry>, String> {
+fn evaluate_socket_tables(
+    netlink_map: &BTreeMap<SocketKey, NetlinkEntry>,
+    proc_map: &BTreeSet<SocketKey>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    for (key, entry) in netlink_map {
+        if !proc_map.contains(key) {
+            findings.push(format!(
+                "from=netlink_only, netns_inum={}, inode={}, proto={}, laddr={}, raddr={}, owner_pids={}, owner_pidns_inum={}",
+                key.netns_inum,
+                key.inode,
+                key.proto,
+                key.local,
+                key.remote,
+                format_pids(&entry.pids),
+                entry.pidns_inum,
+            ));
+        }
+    }
+
+    for key in proc_map {
+        if !netlink_map.contains_key(key) {
+            findings.push(format!(
+                "from=proc_only, netns_inum={}, inode={}, proto={}, laddr={}, raddr={}, owner_pids=unknown",
+                key.netns_inum, key.inode, key.proto, key.local, key.remote
+            ));
+        }
+    }
+
+    findings.sort();
+    findings
+}
+
+fn collect_ss(
+    flag: &str,
+    proto: &str,
+    netns_inum: u32,
+    pidns_inum: u32,
+) -> Result<BTreeMap<SocketKey, NetlinkEntry>, String> {
     let output = Command::new("ss")
         .args(["-H", "-a", "-n", "-p", "-i", flag])
         .output()
@@ -106,31 +140,34 @@ fn collect_ss(flag: &str, proto: &str) -> Result<BTreeMap<SocketKey, NetlinkEntr
         };
 
         let key = SocketKey {
+            netns_inum,
+            inode: extract_inode(line).unwrap_or(0),
             proto: proto.to_string(),
             local,
             remote,
         };
-
-        let inode = extract_inode(line);
-        let pids = extract_pids(line);
-        map.insert(key, NetlinkEntry { inode, pids });
+        let entry = map.entry(key).or_insert_with(|| NetlinkEntry {
+            pids: BTreeSet::new(),
+            pidns_inum,
+        });
+        entry.pids.extend(extract_pids(line));
     }
 
     Ok(map)
 }
 
-fn extract_inode(line: &str) -> Option<String> {
+fn extract_inode(line: &str) -> Option<u64> {
     for segment in line.split_whitespace() {
         if let Some(rest) = segment.strip_prefix("ino:") {
-            if !rest.is_empty() {
-                return Some(rest.to_string());
+            if let Ok(inode) = rest.parse::<u64>() {
+                return Some(inode);
             }
         }
     }
     if let Some(pos) = line.find("ino:") {
         let tail = &line[pos + 4..];
         let inode: String = tail.chars().take_while(|c| !c.is_whitespace()).collect();
-        if !inode.is_empty() {
+        if let Ok(inode) = inode.parse::<u64>() {
             return Some(inode);
         }
     }
@@ -149,6 +186,17 @@ fn extract_pids(line: &str) -> BTreeSet<u32> {
         remaining = &tail[pid_str.len()..];
     }
     set
+}
+
+fn format_pids(pids: &BTreeSet<u32>) -> String {
+    if pids.is_empty() {
+        "∅".to_string()
+    } else {
+        pids.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 fn normalize_ss_endpoint(raw: &str) -> Option<String> {
@@ -174,7 +222,7 @@ fn normalize_ss_endpoint(raw: &str) -> Option<String> {
         "::" => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         other => other
             .parse::<IpAddr>()
-            .unwrap_or_else(|_| IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
     };
 
     let port = if port_part == "*" {
@@ -186,8 +234,8 @@ fn normalize_ss_endpoint(raw: &str) -> Option<String> {
     Some(format_endpoint(addr, port))
 }
 
-fn collect_proc(proto: &str) -> Result<BTreeMap<SocketKey, ProcEntry>, String> {
-    let mut map = BTreeMap::new();
+fn collect_proc(proto: &str, netns_inum: u32) -> Result<BTreeSet<SocketKey>, String> {
+    let mut map = BTreeSet::new();
     let files = [
         format!("/proc/net/{proto}"),
         format!("/proc/net/{}6", proto),
@@ -212,14 +260,17 @@ fn collect_proc(proto: &str) -> Result<BTreeMap<SocketKey, ProcEntry>, String> {
                 Some(value) => value,
                 None => continue,
             };
-            let inode = parts[9].to_string();
+            let Ok(inode) = parts[9].parse::<u64>() else {
+                continue;
+            };
 
-            let key = SocketKey {
+            map.insert(SocketKey {
+                netns_inum,
+                inode,
                 proto: proto.to_string(),
                 local,
                 remote,
-            };
-            map.insert(key, ProcEntry { inode });
+            });
         }
     }
 
@@ -276,18 +327,58 @@ fn format_endpoint(addr: IpAddr, port: u16) -> String {
     }
 }
 
-#[derive(Ord, PartialOrd, Eq, PartialEq)]
-struct SocketKey {
-    proto: String,
-    local: String,
-    remote: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-struct NetlinkEntry {
-    inode: Option<String>,
-    pids: BTreeSet<u32>,
-}
+    fn key(netns_inum: u32, inode: u64) -> SocketKey {
+        SocketKey {
+            netns_inum,
+            inode,
+            proto: "tcp".to_string(),
+            local: "0.0.0.0:8080".to_string(),
+            remote: "0.0.0.0:0".to_string(),
+        }
+    }
 
-struct ProcEntry {
-    inode: String,
+    #[test]
+    fn endpoint_reuse_does_not_join_netlink_and_proc() {
+        let old = key(100, 11);
+        let new = key(100, 12);
+        let netlink = BTreeMap::from([(
+            old,
+            NetlinkEntry {
+                pids: BTreeSet::from([111u32]),
+                pidns_inum: 700,
+            },
+        )]);
+        let proc = BTreeSet::from([new]);
+
+        let findings = evaluate_socket_tables(&netlink, &proc);
+
+        assert_eq!(findings.len(), 2, "findings: {findings:?}");
+        assert!(findings
+            .iter()
+            .any(|line| line.contains("from=netlink_only") && line.contains("inode=11")));
+        assert!(findings
+            .iter()
+            .any(|line| line.contains("from=proc_only") && line.contains("inode=12")));
+    }
+
+    #[test]
+    fn namespace_is_part_of_socket_identity() {
+        let first = key(100, 11);
+        let second = key(200, 11);
+        let netlink = BTreeMap::from([(first.clone(), NetlinkEntry {
+            pids: BTreeSet::new(),
+            pidns_inum: 700,
+        })]);
+        let proc = BTreeSet::from([first, second]);
+
+        let findings = evaluate_socket_tables(&netlink, &proc);
+
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].contains("from=proc_only"));
+        assert!(findings[0].contains("netns_inum=200"));
+    }
 }
