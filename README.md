@@ -13,8 +13,45 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 ## Reading results
 
 - Each scanner prints a bracketed name followed by either findings, `OK`, or an error string.
+- A final `[Profile transaction]` section records the ordered scanner set, the permission rules and the startup record that served the run. `PROFILE_VERDICT=REFUSED` means no scanner was started because no complete, known profile could be selected.
 - The process always exits with code `0`; treat the log itself as the verdict.
 - Findings are heuristics designed for triage; validate before acting.
+
+## Profile transaction
+
+The scanner set, its permission rules and the startup history are one profile
+(`src/profile.rs`). At startup ghostscan loads the selected profile under an
+exclusive store lock, validates it, migrates it if necessary, and writes the
+migrated profile together with its startup record through one
+temporary-file/`fsync`/`rename` transaction. Only after that commit does the
+scanner loop receive the ordered scanner names.
+
+- A version-one profile is migrated to version two by removing the retired
+  `Legacy inode walker (removed in profile v2)` scanner and adding the rules
+  introduced by version two. The retired name stays known as a legacy alias.
+- Existing rules are kept verbatim, rules that already belong to a surviving
+  scanner are not duplicated, and scanners that had no rule still have no rule.
+- Scanner order is validated instead of silently sorted. A profile that would
+  reorder the registry is rejected before any scanner runs.
+- Permission rules are evaluated at startup but never gate a scanner. A denied
+  rule is reported as `permission_error=...`, a scanner without a rule is
+  reported as a missing rule, and the scanner keeps its original permission
+  error text.
+- A failed migration or commit never installs a half profile. The default is to
+  refuse to start (`state=REFUSED`, `PROFILE_VERDICT=REFUSED`, no scanner
+  output). `GHOSTSCAN_PROFILE_ON_MIGRATION_FAILURE=legacy` explicitly selects
+  the complete old profile instead; it never combines old scanners with new
+  rules.
+- Concurrent startups are serialized with `flock`. Each startup is appended to
+  the same profile document and every scanner start record carries the same
+  profile hash; a process can never observe an unknown or partially written
+  profile.
+
+The default store is `$XDG_STATE_HOME/ghostscan` (or
+`$HOME/.local/state/ghostscan`). Set `GHOSTSCAN_PROFILE_DIR` to choose another
+directory, `GHOSTSCAN_PROFILE_FILE` to point at one registry file, and
+`GHOSTSCAN_PROFILE` to select a profile name. The built-in profiles are
+`default` (current) and `legacy` (version one, useful for testing migration).
 
 ## Available scanners
 
@@ -73,6 +110,7 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 
 - Format and lint locally with `cargo fmt && cargo check`.
 - New scanners live in `src/scanners/` and expose `pub fn run() -> ScanOutcome` before being registered in `SCANNERS` inside `src/main.rs`.
+- Profile loading, migration and startup-record code lives in `src/profile.rs`; acceptance checks are `bash tests/acceptance/check_profile_transaction.sh` and `python3 tests/acceptance/simulate_profile_transaction.py`.
 
 ## Operational notes
 

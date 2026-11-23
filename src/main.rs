@@ -1,5 +1,7 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod profile;
+pub mod scan_profile;
 mod scanners;
 
 use scanners::{
@@ -20,9 +22,9 @@ const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
 const COLOR_RESET: &str = "\x1b[0m";
 
-struct Scanner {
-    name: &'static str,
-    func: fn() -> ScanOutcome,
+pub struct Scanner {
+    pub name: &'static str,
+    pub func: fn() -> ScanOutcome,
 }
 
 impl Scanner {
@@ -31,7 +33,7 @@ impl Scanner {
     }
 }
 
-const SCANNERS: &[Scanner] = &[
+pub const SCANNERS: &[Scanner] = &[
     Scanner {
         name: "Hidden LKM (proc/sysfs vs kallsyms clusters)",
         func: hidden_lkm::run,
@@ -234,29 +236,91 @@ const SCANNERS: &[Scanner] = &[
     },
 ];
 
+/// Stable scanner registry order used by the profile transaction.
+pub fn scanner_names() -> Vec<&'static str> {
+    SCANNERS.iter().map(|scanner| scanner.name).collect()
+}
+
 fn main() {
-    for scanner in SCANNERS {
-        println!("[{}]", scanner.name);
-        match scanner.run() {
-            Ok(Some(finding)) => {
-                for line in finding.lines() {
-                    if line.is_empty() {
-                        println!();
-                    } else {
-                        println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+    // One profile transaction fixes the ordered scanner set, permission rules
+    // and startup record before the first scanner runs.  A migration or a
+    // concurrent startup therefore cannot hand this loop a mixed profile.
+    let transaction = profile::ProfileTransaction::start();
+
+    if transaction.should_run() {
+        for (index, name) in transaction.scanner_names().iter().enumerate() {
+            let Some(scanner) = SCANNERS.iter().find(|scanner| scanner.name == name.as_str())
+            else {
+                // A known legacy name can survive in a complete legacy profile
+                // even when this binary no longer implements it.  Record the
+                // start and the missing implementation instead of silently
+                // shrinking the scanner set.
+                transaction.note_scanner_start(name, index);
+                transaction.note_scanner_missing(name);
+                println!("[{name}]");
+                println!(
+                    "{}legacy scanner name has no current implementation{}",
+                    COLOR_RED, COLOR_RESET
+                );
+                continue;
+            };
+
+            transaction.note_scanner_start(name, index);
+            println!("[{}]", scanner.name);
+            let outcome = scanner.run();
+            transaction.note_scanner_outcome(name, &outcome);
+            match outcome {
+                Ok(Some(finding)) => {
+                    for line in finding.lines() {
+                        if line.is_empty() {
+                            println!();
+                        } else {
+                            println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+                        }
+                    }
+                }
+                Ok(None) => println!("{}OK{}", COLOR_GREEN, COLOR_RESET),
+                Err(err) => {
+                    for line in err.lines() {
+                        if line.is_empty() {
+                            println!();
+                        } else {
+                            println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
+                        }
                     }
                 }
             }
-            Ok(None) => println!("{}OK{}", COLOR_GREEN, COLOR_RESET),
-            Err(err) => {
-                for line in err.lines() {
-                    if line.is_empty() {
-                        println!();
-                    } else {
-                        println!("{}{}{}", COLOR_RED, line, COLOR_RESET);
-                    }
-                }
-            }
+        }
+    }
+
+    profile::print_profile_transaction(&transaction);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanner_registry_order_and_size_are_unchanged() {
+        assert_eq!(SCANNERS.len(), 50);
+        assert_eq!(
+            SCANNERS.first().map(|scanner| scanner.name),
+            Some("Hidden LKM (proc/sysfs vs kallsyms clusters)")
+        );
+        assert_eq!(
+            SCANNERS.last().map(|scanner| scanner.name),
+            Some("Kernel message suppression")
+        );
+    }
+
+    #[test]
+    fn scanner_names_are_unique_and_in_registry_order() {
+        let names = scanner_names();
+        assert_eq!(names.len(), SCANNERS.len());
+        let unique: std::collections::BTreeSet<_> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len());
+        for (scanner, name) in SCANNERS.iter().zip(names.iter()) {
+            assert_eq!(scanner.name, *name);
         }
     }
 }
