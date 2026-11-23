@@ -96,6 +96,20 @@ pub fn collect_container_states(limit: usize) -> ContainerInventory {
     inventory
 }
 
+/// Collect the container inventory while distinguishing an unusable collector
+/// from a legitimately empty host.
+///
+/// A host without containers is a valid `Ok` with zero states.  Read and
+/// permission problems while walking a runtime root stay in
+/// [`ContainerInventory::errors`] and therefore remain partial evidence; only
+/// a caller error such as a zero budget makes the collector itself fail.
+pub fn collect_container_states_checked(limit: usize) -> Result<ContainerInventory, String> {
+    if limit == 0 {
+        return Err("container state scan limit must be non-zero".to_string());
+    }
+    Ok(collect_container_states(limit))
+}
+
 fn find_state_files(root: &Path, limit: usize, files: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
     let mut queue = VecDeque::new();
     queue.push_back(root.to_path_buf());

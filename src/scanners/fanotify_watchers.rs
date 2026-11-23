@@ -1,4 +1,5 @@
-use super::container_utils::collect_container_states;
+use super::container_utils::{collect_container_states, ContainerInventory};
+use crate::host_observation::HostObservation;
 use crate::ScanOutcome;
 use std::{
     collections::{HashMap, HashSet},
@@ -11,7 +12,19 @@ struct MountTable {
 }
 
 pub fn run() -> ScanOutcome {
-    let container_roots = collect_container_roots();
+    let inventory = collect_container_states(1024);
+    scan(&inventory)
+}
+
+pub fn run_with_host(host: &HostObservation) -> ScanOutcome {
+    match host.containers() {
+        Ok(inventory) => scan(inventory),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn scan(inventory: &ContainerInventory) -> ScanOutcome {
+    let container_roots = collect_container_roots(inventory);
     let mut findings = Vec::new();
     let mut errors = Vec::new();
 
@@ -201,14 +214,13 @@ fn build_mount_table(pid: u32) -> Result<MountTable, String> {
     Ok(MountTable { map })
 }
 
-fn collect_container_roots() -> Vec<String> {
+fn collect_container_roots(inventory: &ContainerInventory) -> Vec<String> {
     let mut roots = Vec::new();
-    let inventory = collect_container_states(1024);
-    for state in inventory.states {
-        for mount in state.mounts {
+    for state in &inventory.states {
+        for mount in &state.mounts {
             if mount.destination == "/" {
-                if let Some(source) = mount.source {
-                    roots.push(source);
+                if let Some(source) = &mount.source {
+                    roots.push(source.clone());
                 }
             }
         }

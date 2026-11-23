@@ -1,7 +1,9 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod host_observation;
 mod scanners;
 
+use host_observation::HostObservation;
 use scanners::{
     audit_disabled, bpf_kprobe_attachments, bpf_lsm, core_pattern_pipeline, cron_ghost,
     deleted_memfd, fanotify_watchers, ftrace_redirection, hidden_bind_mounts, hidden_listeners,
@@ -25,8 +27,40 @@ struct Scanner {
     func: fn() -> ScanOutcome,
 }
 
+/// Scanners that consume the shared host observation instead of collecting
+/// their own container/task snapshot.
+///
+/// The names are the public scanner registry contract; keeping the mapping
+/// here preserves the existing scanner list, ordering and filtering behaviour.
+const HOST_SCANNERS: &[(&str, fn(&HostObservation) -> ScanOutcome)] = &[
+    (
+        "Sensitive host mounts into containers",
+        sensitive_host_mounts::run_with_host,
+    ),
+    ("Host PID namespace shared", host_pid_ns::run_with_host),
+    ("Host net namespace shared", host_net_ns::run_with_host),
+    (
+        "Overlay lowerdir outside storage root",
+        overlay_lowerdir::run_with_host,
+    ),
+    (
+        "Fanotify watchers on sensitive mounts",
+        fanotify_watchers::run_with_host,
+    ),
+    (
+        "Task list mismatch (BPF vs /proc)",
+        task_list_mismatch::run_with_host,
+    ),
+    ("Hidden PIDs (bpf-only)", hidden_pids::run_with_host),
+];
+
 impl Scanner {
-    fn run(&self) -> ScanOutcome {
+    fn run(&self, host: &HostObservation) -> ScanOutcome {
+        for &(name, func) in HOST_SCANNERS {
+            if name == self.name {
+                return func(host);
+            }
+        }
         (self.func)()
     }
 }
@@ -235,9 +269,13 @@ const SCANNERS: &[Scanner] = &[
 ];
 
 fn main() {
+    // The generation is fixed before the first scanner runs. Every
+    // host-aware scanner and the final report use this same observation.
+    let host = HostObservation::start();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
-        match scanner.run() {
+        match scanner.run(&host) {
             Ok(Some(finding)) => {
                 for line in finding.lines() {
                     if line.is_empty() {
@@ -258,5 +296,43 @@ fn main() {
                 }
             }
         }
+    }
+
+    print_host_observation(&host);
+}
+
+fn print_host_observation(host: &HostObservation) {
+    println!("[Host observation generation]");
+    for line in host.report().render_lines() {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_scanner_mapping_only_references_registered_scanners() {
+        assert_eq!(HOST_SCANNERS.len(), 7);
+        for &(name, _) in HOST_SCANNERS {
+            assert!(
+                SCANNERS.iter().any(|scanner| scanner.name == name),
+                "host scanner {name:?} is not in SCANNERS"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_registry_order_and_size_are_unchanged() {
+        assert_eq!(SCANNERS.len(), 50);
+        assert_eq!(
+            SCANNERS.first().map(|scanner| scanner.name),
+            Some("Hidden LKM (proc/sysfs vs kallsyms clusters)")
+        );
+        assert_eq!(
+            SCANNERS.last().map(|scanner| scanner.name),
+            Some("Kernel message suppression")
+        );
     }
 }

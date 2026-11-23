@@ -16,6 +16,34 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - The process always exits with code `0`; treat the log itself as the verdict.
 - Findings are heuristics designed for triage; validate before acting.
 
+## Host observation generation
+
+Every scan round starts with one shared host observation (`src/host_observation.rs`).
+The container inventory, the BPF task snapshot and the procfs task snapshot are
+collected once, at scan startup, and stamped with the same generation label
+(`boot_id:round:started_at:pid`). The container-aware and task-aware scanners read
+that observation instead of collecting their own copy:
+
+- `Sensitive host mounts into containers`
+- `Host PID namespace shared`
+- `Host net namespace shared`
+- `Overlay lowerdir outside storage root`
+- `Fanotify watchers on sensitive mounts`
+- `Task list mismatch (BPF vs /proc)`
+- `Hidden PIDs (bpf-only)`
+
+The final `[Host observation generation]` block reports the generation, every
+collector status and attempt, the domains that could be merged and
+`same_generation=true|false`, followed by
+`host_observation=COMPLETE|PARTIAL|FAILED`. A failed or cancelled collector leaves
+`containers=FAILED`, `bpf_tasks=FAILED` or `proc_tasks=FAILED` and its evidence
+is not merged; there is no process-wide host cache and ghostscan never falls
+back to containers or tasks from a previous round. Permission-denied or
+partially readable collectors remain visible as `PARTIAL` evidence with their
+original error text. An empty container inventory is still a complete, empty
+observation. Scanner names, ordering and filtering behaviour are unchanged,
+and the process still exits with code `0`; the report block is the verdict.
+
 ## Available scanners
 
 - **Hidden LKM**: compares procfs/sysfs clusters against `kallsyms` to surface hidden modules.
@@ -73,6 +101,8 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 
 - Format and lint locally with `cargo fmt && cargo check`.
 - New scanners live in `src/scanners/` and expose `pub fn run() -> ScanOutcome` before being registered in `SCANNERS` inside `src/main.rs`.
+- Host-wide collectors belong in `src/host_observation.rs`; host-aware scanners should expose `run_with_host(&HostObservation)` and be registered in `HOST_SCANNERS`.
+- Host observation acceptance checks: `bash tests/acceptance/check_host_observation_generation.sh` and `python3 tests/acceptance/simulate_host_rounds.py`.
 
 ## Operational notes
 

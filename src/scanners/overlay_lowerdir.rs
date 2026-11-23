@@ -1,4 +1,5 @@
-use super::container_utils::collect_container_states;
+use super::container_utils::{collect_container_states, ContainerInventory};
+use crate::host_observation::HostObservation;
 use crate::ScanOutcome;
 
 const ALLOWED_PREFIXES: &[&str] = &[
@@ -10,10 +11,21 @@ const ALLOWED_PREFIXES: &[&str] = &[
 
 pub fn run() -> ScanOutcome {
     let inventory = collect_container_states(1024);
-    let mut findings = Vec::new();
-    let errors = inventory.errors;
+    scan(&inventory)
+}
 
-    for state in inventory.states {
+pub fn run_with_host(host: &HostObservation) -> ScanOutcome {
+    match host.containers() {
+        Ok(inventory) => scan(inventory),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn scan(inventory: &ContainerInventory) -> ScanOutcome {
+    let mut findings = Vec::new();
+    let errors = &inventory.errors;
+
+    for state in &inventory.states {
         for mount in &state.mounts {
             for option in &mount.options {
                 if let Some(rest) = option.strip_prefix("lowerdir=") {
