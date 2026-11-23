@@ -1,5 +1,6 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod persistence;
 mod scanners;
 
 use scanners::{
@@ -235,6 +236,11 @@ const SCANNERS: &[Scanner] = &[
 ];
 
 fn main() {
+    // One file/persistence observation generation is captured before any
+    // scanner runs.  SSH, sudo (including its include chain), PAM/NSS and
+    // systemd scanners and the final report all read this same snapshot.
+    persistence::PERSISTENCE.begin_scan();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
         match scanner.run() {
@@ -258,5 +264,21 @@ fn main() {
                 }
             }
         }
+    }
+
+    print_persistence_observation();
+}
+
+/// Print the shared persistence observation.
+///
+/// Every finding in this block carries the same generation label, the source
+/// file that produced it and the include chain that reached that file.  A
+/// failed or partially readable snapshot is never combined with a previous
+/// generation.
+fn print_persistence_observation() {
+    let snapshot = persistence::PERSISTENCE.snapshot();
+    println!("[Persistence evidence (one host observation)]");
+    for line in snapshot.report_lines() {
+        println!("{line}");
     }
 }

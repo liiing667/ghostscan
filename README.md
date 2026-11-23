@@ -16,6 +16,46 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - The process always exits with code `0`; treat the log itself as the verdict.
 - Findings are heuristics designed for triage; validate before acting.
 
+## Persistence observation generation
+
+Every scan round starts with one shared file observation (`src/persistence.rs`).
+SSH `authorized_keys`, `/etc/sudoers` and its `#include`/`#includedir` chain,
+PAM/NSS configuration and systemd units (with their drop-ins) are captured once,
+at scan startup, and stamped with the same generation label
+(`boot_id:generation:started_at:pid`). The four file-backed scanners read that
+observation instead of collecting their own copy:
+
+- `SSH footholds (forced/wildcard/insecure)`
+- `sudoers dangerous entries`
+- `PAM/NSS modules from non-system paths`
+- `systemd ghost units (exec in tmp/deleted)`
+
+The include closure is resolved inside the snapshot, so a `#include` can never
+name a file from a different generation than the file containing the directive.
+Symlinks are resolved once and both the link inode and its target identity are
+recorded. A second identity fence re-reads the whole snapshot; if a file,
+symlink, directory or include edge changed, the generation is discarded and
+retried from an empty snapshot (`MAX_GENERATION_ATTEMPTS`). Evidence from a
+failed generation is never merged into the retry, and an unreadable include is
+kept as a `PARTIAL` error on its own generation rather than falling back to an
+older copy.
+
+The final `[Persistence evidence (one host observation)]` block reports the
+generation, attempt count, `same_generation=true|false`, each source's files and
+include chains, and every finding with its source file, include chain and
+generation, followed by
+`persistence_observation=COMPLETE|PARTIAL|FAILED`. Legitimate SSH/sudo/PAM/systemd
+configuration, masked systemd units, permission errors and genuinely empty
+results remain explicit observations. Scanner names, ordering and filtering
+behaviour are unchanged, and the process still exits with code `0`; the report
+block is the verdict.
+
+`GHOSTSCAN_ROOT` may point at a staged filesystem root for offline acceptance;
+displayed paths remain logical (`/etc/sudoers`, `/root/.ssh/authorized_keys`, ...).
+Run `bash tests/acceptance/check_persistence_observation.sh` for the structural
+checks and `tests/acceptance/simulate_persistence_generations.py` for the
+rotation, symlink, unreadable-include, retry and empty-result scenarios.
+
 ## Available scanners
 
 - **Hidden LKM**: compares procfs/sysfs clusters against `kallsyms` to surface hidden modules.
