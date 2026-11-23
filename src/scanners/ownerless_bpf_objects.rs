@@ -1,49 +1,53 @@
+use crate::bpf_lifecycle::{
+    conflict_error, scanner_error, BPF_TRANSACTION, BpfSnapshot, BpfTransaction, CollectorKind,
+};
 use crate::ScanOutcome;
-use std::process::Command;
 
 pub fn run() -> ScanOutcome {
-    if Command::new("bpftool").arg("--version").output().is_err() {
-        return Err("bpftool not available to enumerate BPF objects".to_string());
+    run_with_bpf(&BPF_TRANSACTION)
+}
+
+/// Ownerless-program scan sharing the caller's lifecycle transaction.
+///
+/// The program list carries the same boot/generation stamp as every other BPF
+/// scanner, so a program detached and repinned between collectors cannot be
+/// paired with a link observed in another generation.
+pub fn run_with_bpf(transaction: &BpfTransaction) -> ScanOutcome {
+    let snapshot = transaction.snapshot();
+    run_with_snapshot(&snapshot)
+}
+
+pub fn run_with_snapshot(snapshot: &BpfSnapshot) -> ScanOutcome {
+    if let Some(error) = scanner_error(
+        snapshot,
+        CollectorKind::Programs,
+        "bpftool not available to enumerate BPF objects",
+    ) {
+        return Err(error);
     }
 
-    let output = Command::new("bpftool")
-        .args(["-j", "prog", "show"])
-        .output()
-        .map_err(|err| format!("failed to execute bpftool prog show: {err}"))?;
-    if !output.status.success() {
-        return Err(format!("bpftool prog show exited with {}", output.status));
+    if let Some(error) = conflict_error(snapshot) {
+        return Err(error);
     }
-
-    let progs: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse bpftool prog output: {err}"))?;
 
     let mut findings = Vec::new();
-
-    if let Some(programs) = progs.as_array() {
-        for prog in programs {
-            if let Some(id) = prog.get("id").and_then(|v| v.as_u64()) {
-                let has_pinned = prog
-                    .get("pinned")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| !arr.is_empty())
-                    .unwrap_or(false);
-                let has_fd = prog
-                    .get("pids")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| !arr.is_empty())
-                    .unwrap_or(false);
-                if !has_pinned && !has_fd {
-                    let name = prog
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    findings.push(format!(
-                        "object=prog, id={}, name={}, pinned=false, owner_pids=∅",
-                        id, name
-                    ));
-                }
-            }
+    for program in &snapshot.programs {
+        // Keep the original ownerless semantics: an anonymous program has no
+        // task holding an fd and no pin keeping it alive.  Both identities come
+        // from the same lifecycle generation.
+        let has_pinned = program.pinned_flag || !program.pinned.is_empty();
+        let has_fd = !program.owner_pids.is_empty();
+        if has_pinned || has_fd {
+            continue;
         }
+        findings.push(format!(
+            "object=prog, id={}, name={}, pinned=false, owner_pids=∅, tag={}, generation={}, boot_id={}",
+            program.id,
+            program.name,
+            program.tag,
+            program.stamp.label(),
+            program.stamp.boot_id
+        ));
     }
 
     if findings.is_empty() {

@@ -1,70 +1,75 @@
+use crate::bpf_lifecycle::{
+    conflict_error, scanner_error, BpfSnapshot, BpfTransaction, CollectorKind, LinkRecord,
+    BPF_TRANSACTION,
+};
 use crate::ScanOutcome;
-use std::process::Command;
 
 pub fn run() -> ScanOutcome {
-    if Command::new("bpftool").arg("--version").output().is_err() {
-        return Err("bpftool not available to inspect BPF links".to_string());
+    run_with_bpf(&BPF_TRANSACTION)
+}
+
+/// Kprobe/kretprobe attachment scan sharing the caller's lifecycle
+/// transaction.  A link is published only together with the program tag from
+/// the same generation, which makes a detached/reused program id visible
+/// instead of merging two observations.
+pub fn run_with_bpf(transaction: &BpfTransaction) -> ScanOutcome {
+    let snapshot = transaction.snapshot();
+    run_with_snapshot(&snapshot)
+}
+
+pub fn run_with_snapshot(snapshot: &BpfSnapshot) -> ScanOutcome {
+    if let Some(error) = scanner_error(
+        snapshot,
+        CollectorKind::Links,
+        "bpftool not available to inspect BPF links",
+    ) {
+        return Err(error);
     }
 
-    let output = Command::new("bpftool")
-        .args(["-j", "link", "show"])
-        .output()
-        .map_err(|err| format!("failed to execute bpftool link show: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!("bpftool link show exited with {}", output.status));
+    if let Some(error) = conflict_error(snapshot) {
+        return Err(error);
     }
-
-    let links: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse bpftool link output: {err}"))?;
 
     let mut findings = Vec::new();
 
-    if let Some(array) = links.as_array() {
-        for link in array {
-            let link_type = link
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            let attach_type = link
-                .get("attach_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            let is_kprobe = link_type.contains("kprobe") || attach_type.contains("kprobe");
-            let is_kretprobe = link_type.contains("kretprobe") || attach_type.contains("kretprobe");
-
-            if !is_kprobe && !is_kretprobe {
-                continue;
-            }
-
-            let target = extract_target_symbol(link).unwrap_or_else(|| "unknown".to_string());
-            if !is_sensitive_symbol(&target) {
-                continue;
-            }
-
-            let link_id = link
-                .get("id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let prog_id = link
-                .get("prog_id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let attach_kind = if is_kretprobe { "kretprobe" } else { "kprobe" };
-
-            findings.push(format!(
-                "link_id={}, prog_id={}, attach={}, target={}",
-                link_id, prog_id, attach_kind, target
-            ));
+    for link in &snapshot.links {
+        if !is_kprobe_link(link) && !is_kretprobe_link(link) {
+            continue;
         }
+
+        let target = extract_target_symbol(link).unwrap_or_else(|| "unknown".to_string());
+        if !is_sensitive_symbol(&target) {
+            continue;
+        }
+
+        let prog_tag = link
+            .prog_tag
+            .clone()
+            .or_else(|| {
+                link.prog_id
+                    .and_then(|id| snapshot.program(id))
+                    .map(|program| program.tag.clone())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let attach_kind = if is_kretprobe_link(link) {
+            "kretprobe"
+        } else {
+            "kprobe"
+        };
+
+        findings.push(format!(
+            "link_id={}, prog_id={}, attach={}, target={}, prog_tag={}, generation={}, boot_id={}",
+            link.id,
+            link.prog_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            attach_kind,
+            target,
+            prog_tag,
+            link.stamp.label(),
+            link.stamp.boot_id
+        ));
     }
 
     if findings.is_empty() {
@@ -75,31 +80,24 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn extract_target_symbol(link: &serde_json::Value) -> Option<String> {
-    const CANDIDATES: [&str; 5] = ["target_name", "func", "function", "kprobe", "attach_name"];
-    for key in &CANDIDATES {
-        if let Some(value) = link.get(key).and_then(|v| v.as_str()) {
-            let cleaned = value.trim();
-            if !cleaned.is_empty() {
-                return Some(cleaned.to_string());
-            }
-        }
-    }
+fn is_kprobe_link(link: &LinkRecord) -> bool {
+    let link_type = link.link_type.to_ascii_lowercase();
+    let attach_type = link.attach_type.to_ascii_lowercase();
+    link_type.contains("kprobe") || attach_type.contains("kprobe")
+}
 
-    if let Some(map) = link.as_object() {
-        for (key, value) in map {
-            if key.contains("func") || key.contains("symbol") {
-                if let Some(v) = value.as_str() {
-                    let cleaned = v.trim();
-                    if !cleaned.is_empty() {
-                        return Some(cleaned.to_string());
-                    }
-                }
-            }
-        }
+fn extract_target_symbol(link: &LinkRecord) -> Option<String> {
+    if link.target.trim().is_empty() {
+        None
+    } else {
+        Some(link.target.clone())
     }
+}
 
-    None
+fn is_kretprobe_link(link: &LinkRecord) -> bool {
+    let link_type = link.link_type.to_ascii_lowercase();
+    let attach_type = link.attach_type.to_ascii_lowercase();
+    link_type.contains("kretprobe") || attach_type.contains("kretprobe")
 }
 
 fn is_sensitive_symbol(symbol: &str) -> bool {

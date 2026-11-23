@@ -1,70 +1,67 @@
+use crate::bpf_lifecycle::{
+    conflict_error, scanner_error, BpfSnapshot, BpfTransaction, CollectorKind, MapRecord,
+    BPF_TRANSACTION,
+};
 use crate::ScanOutcome;
-use std::process::Command;
 
 pub fn run() -> ScanOutcome {
-    if Command::new("bpftool").arg("--version").output().is_err() {
-        return Err("bpftool not available to inspect SOCKMAP/SOCKHASH state".to_string());
+    run_with_bpf(&BPF_TRANSACTION)
+}
+
+/// Sockmap/sockhash verdict scan sharing the caller's lifecycle transaction.
+pub fn run_with_bpf(transaction: &BpfTransaction) -> ScanOutcome {
+    let snapshot = transaction.snapshot();
+    run_with_snapshot(&snapshot)
+}
+
+pub fn run_with_snapshot(snapshot: &BpfSnapshot) -> ScanOutcome {
+    if let Some(error) = scanner_error(
+        snapshot,
+        CollectorKind::Maps,
+        "bpftool not available to inspect SOCKMAP/SOCKHASH state",
+    ) {
+        return Err(error);
     }
 
-    let output = Command::new("bpftool")
-        .args(["-j", "map", "show"])
-        .output()
-        .map_err(|err| format!("failed to execute bpftool map show: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!("bpftool map show exited with {}", output.status));
+    if let Some(error) = conflict_error(snapshot) {
+        return Err(error);
     }
-
-    let maps: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse bpftool map output: {err}"))?;
 
     let mut findings = Vec::new();
 
-    if let Some(array) = maps.as_array() {
-        for map in array {
-            let map_type = map
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-
-            if map_type != "sockmap" && map_type != "sockhash" {
-                continue;
-            }
-
-            let map_id = map
-                .get("id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let has_pin = map.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
-
-            let owner_pids = map
-                .get("pids")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|pid| pid.as_u64())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            if has_pin || !owner_pids.is_empty() {
-                continue;
-            }
-
-            let verdict_prog = map
-                .get("verdict_prog_id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            findings.push(format!(
-                "map_id={}, type={}, verdict_prog_id={}, has_pin=false, owner_pids=∅",
-                map_id, map_type, verdict_prog
-            ));
+    for map in &snapshot.maps {
+        let map_type = map.map_type.to_ascii_lowercase();
+        if map_type != "sockmap" && map_type != "sockhash" {
+            continue;
         }
+
+        if has_pin(map) || !map.owner_pids.is_empty() {
+            continue;
+        }
+
+        let verdict_prog = map
+            .verdict_prog_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let verdict_tag = map
+            .verdict_prog_tag
+            .clone()
+            .or_else(|| {
+                map.verdict_prog_id
+                    .and_then(|id| snapshot.program(id))
+                    .map(|program| program.tag.clone())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        findings.push(format!(
+            "map_id={}, type={}, verdict_prog_id={}, has_pin=false, owner_pids=∅, verdict_prog_tag={}, generation={}, boot_id={}",
+            map.id,
+            map.map_type,
+            verdict_prog,
+            verdict_tag,
+            map.stamp.label(),
+            map.stamp.boot_id
+        ));
     }
 
     if findings.is_empty() {
@@ -73,4 +70,8 @@ pub fn run() -> ScanOutcome {
         findings.sort();
         Ok(Some(findings.join("\n")))
     }
+}
+
+fn has_pin(map: &MapRecord) -> bool {
+    map.pinned_flag || !map.pinned.is_empty()
 }

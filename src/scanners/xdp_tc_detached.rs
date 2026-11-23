@@ -1,6 +1,8 @@
+use crate::bpf_lifecycle::{
+    conflict_error, scanner_error, BpfSnapshot, BpfTransaction, CollectorKind, BPF_TRANSACTION,
+};
 use crate::ScanOutcome;
 use serde_json::Value;
-use std::process::Command;
 
 fn value_has_meaningful_data(value: &Value) -> bool {
     match value {
@@ -13,27 +15,42 @@ fn value_has_meaningful_data(value: &Value) -> bool {
 }
 
 pub fn run() -> ScanOutcome {
-    if Command::new("bpftool").arg("--version").output().is_err() {
-        return Err("bpftool not available to inspect XDP/TC programs".to_string());
+    run_with_bpf(&BPF_TRANSACTION)
+}
+
+/// XDP/TC scan sharing the caller's lifecycle transaction.
+///
+/// The raw `bpftool net list` payload is preserved because its shape is part of
+/// the public scanner output; the generation label is carried by the shared
+/// transaction summary printed after the scanner loop.
+pub fn run_with_bpf(transaction: &BpfTransaction) -> ScanOutcome {
+    let snapshot = transaction.snapshot();
+    run_with_snapshot(&snapshot)
+}
+
+pub fn run_with_snapshot(snapshot: &BpfSnapshot) -> ScanOutcome {
+    if let Some(error) = scanner_error(
+        snapshot,
+        CollectorKind::Net,
+        "bpftool not available to inspect XDP/TC programs",
+    ) {
+        return Err(error);
     }
 
-    let output = Command::new("bpftool")
-        .args(["-j", "net", "list"])
-        .output()
-        .map_err(|err| format!("failed to execute bpftool net list: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!("bpftool net list exited with {}", output.status));
+    if let Some(error) = conflict_error(snapshot) {
+        return Err(error);
     }
 
-    let payload = String::from_utf8_lossy(&output.stdout);
+    let Some(payload) = snapshot.net_list.as_deref() else {
+        return Ok(None);
+    };
     let payload = payload.trim();
     if payload.is_empty() {
-        Ok(None)
-    } else {
-        match serde_json::from_str::<Value>(payload) {
-            Ok(value) if !value_has_meaningful_data(&value) => Ok(None),
-            _ => Ok(Some(payload.to_string())),
-        }
+        return Ok(None);
+    }
+
+    match serde_json::from_str::<Value>(payload) {
+        Ok(value) if !value_has_meaningful_data(&value) => Ok(None),
+        _ => Ok(Some(payload.to_string())),
     }
 }

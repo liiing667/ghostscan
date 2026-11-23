@@ -1,5 +1,6 @@
 pub type ScanOutcome = Result<Option<String>, String>;
 
+pub mod bpf_lifecycle;
 mod scanners;
 
 use scanners::{
@@ -235,6 +236,12 @@ const SCANNERS: &[Scanner] = &[
 ];
 
 fn main() {
+    // One BPF lifecycle generation is created before any scanner runs.  Every
+    // BPF scanner consumes this transaction through its `run_with_bpf` entry
+    // point and the final report prints the same boot/generation identity.
+    let bpf = &bpf_lifecycle::BPF_TRANSACTION;
+    bpf.begin_scan();
+
     for scanner in SCANNERS {
         println!("[{}]", scanner.name);
         match scanner.run() {
@@ -258,5 +265,11 @@ fn main() {
                 }
             }
         }
+    }
+
+    println!("[BPF lifecycle transaction (boot/program/map/attach/pin)]");
+    match bpf_lifecycle::final_scan_outcome(bpf) {
+        Ok(Some(summary)) | Err(summary) => println!("{summary}"),
+        Ok(None) => {}
     }
 }

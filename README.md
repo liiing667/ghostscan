@@ -16,6 +16,24 @@ Fast one-shot sweep for Linux incident response. Drop the binary on a host, run 
 - The process always exits with code `0`; treat the log itself as the verdict.
 - Findings are heuristics designed for triage; validate before acting.
 
+## BPF lifecycle transaction
+
+All BPF object scanners share one lifecycle generation per scan round.  Before
+the scanner loop starts, ghostscan records the boot id and creates a
+process-local generation stamp.  Programs, maps, links/attachments and pins are
+then collected once; every scanner and the final `BPF_LIFECYCLE` summary read
+the same stamped records.
+
+An identity fence re-reads the object families after the first pass.  If a
+program is detached and a new program reuses its numeric id, if a pin is moved,
+or if any object changes name/tag/type/attachment between collectors, the whole
+generation is discarded and retried from an empty snapshot.  Evidence from the
+failed generation is never merged with the retry.  Legal bpffs pins, anonymous
+(ownerless) programs, distinct kprobe/kretprobe and XDP/TC attach types, and
+permission failures remain explicit observations.  The final `BPF_LIFECYCLE`
+line repeats the boot/generation label and an `object_identity` list so the
+three public object scanners and the summary can be compared directly.
+
 ## Available scanners
 
 - **Hidden LKM**: compares procfs/sysfs clusters against `kallsyms` to surface hidden modules.

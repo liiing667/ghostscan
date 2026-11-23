@@ -1,56 +1,57 @@
-use crate::ScanOutcome;
-use serde_json::Value;
-use std::{
-    collections::BTreeSet,
-    process::{Command, Stdio},
+use crate::bpf_lifecycle::{
+    conflict_error, dump_program_xlated, scanner_error, verify_program_tag, BpfSnapshot,
+    BpfTransaction, CollectorKind, ProgramRecord, BPF_TRANSACTION,
 };
+use crate::ScanOutcome;
+use std::collections::BTreeSet;
 
 pub fn run() -> ScanOutcome {
-    if Command::new("bpftool")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
-        return Err("bpftool not available to inspect kfunc usage".to_string());
+    run_with_bpf(&BPF_TRANSACTION)
+}
+
+/// Sensitive-kfunc scan sharing the caller's lifecycle transaction.
+///
+/// Program ids come from the transaction snapshot and every dump is checked
+/// against the snapshot tag before its symbols are published.  If the id was
+/// detached and reused while the dump was running, the evidence is discarded
+/// instead of being attached to the earlier program.
+pub fn run_with_bpf(transaction: &BpfTransaction) -> ScanOutcome {
+    let snapshot = transaction.snapshot();
+    run_with_snapshot(&snapshot)
+}
+
+pub fn run_with_snapshot(snapshot: &BpfSnapshot) -> ScanOutcome {
+    if let Some(error) = scanner_error(
+        snapshot,
+        CollectorKind::Programs,
+        "bpftool not available to inspect kfunc usage",
+    ) {
+        return Err(error);
     }
 
-    let output = Command::new("bpftool")
-        .args(["-j", "prog", "show"])
-        .output()
-        .map_err(|err| format!("failed to execute bpftool prog show: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!("bpftool prog show exited with {}", output.status));
+    if let Some(error) = conflict_error(snapshot) {
+        return Err(error);
     }
-
-    let progs: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse bpftool prog output: {err}"))?;
 
     let mut findings = Vec::new();
     let mut errors = Vec::new();
 
-    if let Some(array) = progs.as_array() {
-        for prog in array {
-            let id = prog.get("id").and_then(|v| v.as_u64());
-            let name = prog
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            let Some(id) = id else {
-                continue;
-            };
-
-            match inspect_program(id) {
-                Ok(kfuncs) if !kfuncs.is_empty() => {
-                    let joined = kfuncs.into_iter().collect::<Vec<_>>().join("|");
-                    findings.push(format!("prog_id={}, name={}, kfuncs={}", id, name, joined));
-                }
-                Ok(_) => {}
-                Err(err) => errors.push(format!("prog_id={}: {}", id, err)),
+    for program in &snapshot.programs {
+        match inspect_program(program) {
+            Ok(kfuncs) if !kfuncs.is_empty() => {
+                let joined = kfuncs.into_iter().collect::<Vec<_>>().join("|");
+                findings.push(format!(
+                    "prog_id={}, name={}, kfuncs={}, tag={}, generation={}, boot_id={}",
+                    program.id,
+                    program.name,
+                    joined,
+                    program.tag,
+                    program.stamp.label(),
+                    program.stamp.boot_id
+                ));
             }
+            Ok(_) => {}
+            Err(err) => errors.push(format!("prog_id={}: {}", program.id, err)),
         }
     }
 
@@ -69,18 +70,8 @@ pub fn run() -> ScanOutcome {
     }
 }
 
-fn inspect_program(id: u64) -> Result<BTreeSet<String>, String> {
-    let id_str = id.to_string();
-    let output = Command::new("bpftool")
-        .args(["prog", "dump", "xlated", "id", &id_str])
-        .output()
-        .map_err(|err| format!("failed to dump program: {err}"))?;
-
-    if !output.status.success() {
-        return Err(format!("dump failed with status {}", output.status));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
+fn inspect_program(program: &ProgramRecord) -> Result<BTreeSet<String>, String> {
+    let text = dump_program_xlated(program.id)?;
     let mut matches = BTreeSet::new();
 
     for line in text.lines() {
@@ -89,6 +80,13 @@ fn inspect_program(id: u64) -> Result<BTreeSet<String>, String> {
                 matches.insert(symbol);
             }
         }
+    }
+
+    // `prog dump xlated id N` only carries the numeric id.  Re-read that id
+    // after the dump and compare the tag with the transaction record; a
+    // different tag means the old program was detached and the id was reused.
+    if !matches.is_empty() {
+        verify_program_tag(program.id, &program.tag)?;
     }
 
     Ok(matches)
