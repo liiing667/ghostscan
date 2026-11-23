@@ -1,4 +1,4 @@
-use super::container_utils::collect_container_states;
+use super::discovery::snapshot;
 use crate::ScanOutcome;
 
 const ALLOWED_PREFIXES: &[&str] = &[
@@ -9,11 +9,11 @@ const ALLOWED_PREFIXES: &[&str] = &[
 ];
 
 pub fn run() -> ScanOutcome {
-    let inventory = collect_container_states(1024);
+    let discovery = snapshot();
     let mut findings = Vec::new();
-    let errors = inventory.errors;
+    let errors = &discovery.inventory_errors;
 
-    for state in inventory.states {
+    for state in &discovery.containers {
         for mount in &state.mounts {
             for option in &mount.options {
                 if let Some(rest) = option.strip_prefix("lowerdir=") {

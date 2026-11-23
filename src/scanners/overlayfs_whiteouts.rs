@@ -1,36 +1,29 @@
+use super::discovery::snapshot;
 use crate::ScanOutcome;
 use std::{
     collections::VecDeque,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 pub fn run() -> ScanOutcome {
-    let mountinfo = match fs::read_to_string("/proc/self/mountinfo") {
-        Ok(content) => content,
-        Err(err) => return Err(format!("failed to read mountinfo: {err}")),
-    };
-
-    let mut mountpoints = Vec::new();
-    for line in mountinfo.lines() {
-        if let Some((prefix, rest)) = line.split_once(" - ") {
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            if fields.get(0) == Some(&"overlay") {
-                if let Some(mp) = prefix.split_whitespace().nth(4) {
-                    mountpoints.push(PathBuf::from(mp));
-                }
-            }
-        }
+    let discovery = snapshot();
+    if let Some(err) = &discovery.mountinfo_error {
+        return Err(format!("failed to read mountinfo: {err}"));
     }
 
     let mut findings = Vec::new();
-    for mount in mountpoints {
-        if !mount.exists() {
+    for mount in &discovery.mounts {
+        if mount.fs_type != "overlay" {
             continue;
         }
-        match scan_mount(&mount, 5000) {
+        let root = mount.mount_point_path();
+        if !root.exists() {
+            continue;
+        }
+        match scan_mount(&root, 5000) {
             Ok(mut list) => findings.append(&mut list),
-            Err(err) => findings.push(format!("{}: {}", mount.display(), err)),
+            Err(err) => findings.push(format!("{}: {}", root.display(), err)),
         }
     }
 

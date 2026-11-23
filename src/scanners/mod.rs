@@ -5,6 +5,7 @@ pub mod container_utils;
 pub mod core_pattern_pipeline;
 pub mod cron_ghost;
 pub mod deleted_memfd;
+pub mod discovery;
 pub mod fanotify_watchers;
 pub mod ftrace_redirection;
 pub mod hidden_bind_mounts;

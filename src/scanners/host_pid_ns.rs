@@ -1,35 +1,21 @@
-use super::container_utils::collect_container_states;
+use super::discovery::{snapshot, NsResolution};
 use crate::ScanOutcome;
-use std::fs;
 
 pub fn run() -> ScanOutcome {
-    let host_ns = match fs::read_link("/proc/1/ns/pid") {
-        Ok(link) => link,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                return Ok(None);
-            }
-            return Err(format!("failed to read host pid ns: {err}"));
-        }
+    let discovery = snapshot();
+    let host_ns = match &discovery.host_pid_ns {
+        NsResolution::Resolved(target) => target,
+        NsResolution::PermissionDenied => return Ok(None),
+        NsResolution::Failed(err) => return Err(format!("failed to read host pid ns: {err}")),
     };
 
-    let inventory = collect_container_states(1024);
     let mut findings = Vec::new();
-    let errors = inventory.errors;
+    let errors = &discovery.inventory_errors;
 
-    for state in inventory.states {
-        if let Some(pid) = state.pid {
-            match fs::read_link(format!("/proc/{pid}/ns/pid")) {
-                Ok(link) => {
-                    if link == host_ns {
-                        findings.push(format!("container_id={}, host_pid_ns=true", state.id));
-                    }
-                }
-                Err(err) => {
-                    if err.kind() != std::io::ErrorKind::PermissionDenied {
-                        continue;
-                    }
-                }
+    for state in &discovery.containers {
+        if let Some(pid_ns) = &state.pid_ns {
+            if pid_ns == host_ns {
+                findings.push(format!("container_id={}, host_pid_ns=true", state.id));
             }
         }
     }

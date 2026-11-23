@@ -1,8 +1,8 @@
+use super::discovery::snapshot;
 use crate::ScanOutcome;
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -18,13 +18,16 @@ pub fn run() -> ScanOutcome {
         return Err("bpftool not available to inspect pinned objects".to_string());
     }
 
-    let mounts = match parse_mountinfo() {
-        Ok(mut list) => {
-            list.sort_by_key(|entry| std::cmp::Reverse(entry.mount_point.components().count()));
-            list
-        }
-        Err(err) => return Err(format!("failed to parse /proc/self/mountinfo: {err}")),
-    };
+    let discovery = snapshot();
+    if let Some(err) = &discovery.mountinfo_error {
+        return Err(format!("failed to parse /proc/self/mountinfo: {err}"));
+    }
+    let mut mounts: Vec<(PathBuf, &str)> = discovery
+        .mounts
+        .iter()
+        .map(|mount| (mount.mount_point_path(), mount.fs_type.as_str()))
+        .collect();
+    mounts.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
 
     let mut pins = Vec::new();
     let mut errors = Vec::new();
@@ -155,74 +158,10 @@ fn collect_paths(value: &Value, set: &mut BTreeSet<String>) {
     }
 }
 
-struct MountEntry {
-    mount_point: PathBuf,
-    fstype: String,
-}
-
-fn parse_mountinfo() -> std::io::Result<Vec<MountEntry>> {
-    let content = fs::read_to_string("/proc/self/mountinfo")?;
-    let mut mounts = Vec::new();
-
-    for line in content.lines() {
-        if let Some((pre, post)) = line.split_once(" - ") {
-            let mut post_fields = post.split_whitespace();
-            let fstype = post_fields.next().unwrap_or("").to_string();
-
-            let fields: Vec<&str> = pre.split_whitespace().collect();
-            if fields.len() < 5 {
-                continue;
-            }
-            let mount_point = decode_mount_field(fields[4]);
-            mounts.push(MountEntry {
-                mount_point: PathBuf::from(mount_point),
-                fstype,
-            });
-        }
-    }
-
-    Ok(mounts)
-}
-
-fn decode_mount_field(field: &str) -> String {
-    let mut result = String::new();
-    let mut chars = field.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let (Some(a), Some(b), Some(c)) = (chars.next(), chars.next(), chars.next()) {
-                let code = [a, b, c];
-                let decoded = match &code {
-                    ['0', '4', '0'] => ' ',
-                    ['0', '1', '1'] => '\t',
-                    ['0', '1', '2'] => '\n',
-                    ['0', '1', '3'] => '\r',
-                    ['0', '1', '4'] => 0x0c as char,
-                    ['0', '1', '5'] => 0x0b as char,
-                    ['0', '1', '6'] => 0x0e as char,
-                    ['0', '1', '7'] => 0x0f as char,
-                    ['0', '1', '0'] => 0x08 as char,
-                    ['1', '3', '4'] => '\\',
-                    _ => {
-                        result.push('\\');
-                        result.push(a);
-                        result.push(b);
-                        result.push(c);
-                        continue;
-                    }
-                };
-                result.push(decoded);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
-fn mount_type_for<'a>(path: &Path, mounts: &'a [MountEntry]) -> Option<&'a str> {
+fn mount_type_for<'a>(path: &Path, mounts: &'a [(PathBuf, &'a str)]) -> Option<&'a str> {
     for entry in mounts {
-        if path.starts_with(&entry.mount_point) {
-            return Some(entry.fstype.as_str());
+        if path.starts_with(&entry.0) {
+            return Some(entry.1);
         }
     }
     None

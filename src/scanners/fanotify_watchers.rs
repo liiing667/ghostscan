@@ -1,4 +1,4 @@
-use super::container_utils::collect_container_states;
+use super::discovery::snapshot;
 use crate::ScanOutcome;
 use std::{
     collections::{HashMap, HashSet},
@@ -203,12 +203,12 @@ fn build_mount_table(pid: u32) -> Result<MountTable, String> {
 
 fn collect_container_roots() -> Vec<String> {
     let mut roots = Vec::new();
-    let inventory = collect_container_states(1024);
-    for state in inventory.states {
-        for mount in state.mounts {
+    let discovery = snapshot();
+    for state in &discovery.containers {
+        for mount in &state.mounts {
             if mount.destination == "/" {
-                if let Some(source) = mount.source {
-                    roots.push(source);
+                if let Some(source) = &mount.source {
+                    roots.push(source.clone());
                 }
             }
         }
